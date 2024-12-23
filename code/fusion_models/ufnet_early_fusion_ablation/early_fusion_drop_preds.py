@@ -1,3 +1,7 @@
+'''
+Summary:
+UFNet will early-fusion variant (+ prediction withholding)
+'''
 import os
 import copy
 import pickle
@@ -30,6 +34,8 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/")
 from constants import *
 
 '''
@@ -664,7 +670,7 @@ Choice 0
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 

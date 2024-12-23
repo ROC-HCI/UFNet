@@ -423,7 +423,7 @@ def evaluate(model, dataloader, num_trials, num_buckets):
 @click.option("--gamma",default=0.5371176151387734 )
 @click.option("--patience",default=4)
 def main(**cfg):
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 

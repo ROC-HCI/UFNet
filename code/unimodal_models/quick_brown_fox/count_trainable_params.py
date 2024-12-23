@@ -1,3 +1,7 @@
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
 import os
 import copy
 import pickle
@@ -26,9 +30,6 @@ import click
 import json
 from imblearn.over_sampling import SMOTE
  
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
 import imblearn
 import re
 

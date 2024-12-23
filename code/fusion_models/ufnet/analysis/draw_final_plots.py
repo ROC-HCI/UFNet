@@ -10,6 +10,11 @@ import click
 import imblearn
 import scipy
 
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from torch.distributions import Categorical
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -30,15 +35,10 @@ from mlxtend.plotting import plot_confusion_matrix
 from imblearn.over_sampling import SMOTE, SMOTENC, SVMSMOTE, ADASYN, BorderlineSMOTE, KMeansSMOTE, SMOTEN, RandomOverSampler
 from imblearn.combine import SMOTEENN, SMOTETomek
 
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torch.distributions import Categorical
-
 import matplotlib as mpl
 
 # Load seeds from the wandb experiments
-df_seeds = pd.read_csv("../../performance_analysis/wandb_reports/final_fusion_drop_preds_May132024.csv")
+df_seeds = pd.read_csv(os.path.join("/localdisk1/PARK/ufnet_aaai/UFNet/code", "performance_analysis/wandb_reports/final_fusion_drop_preds_May132024.csv"))
 seeds = list(df_seeds["seed"])
 
 def safe_divide(numerator, denominator):
@@ -183,7 +183,7 @@ def main(**cfg):
 
     for seed in seeds:
         print(f"Running experiment for seed: {seed}")
-        with open(f'outputs/preds_with_ids_{seed}.pkl', 'rb') as f:
+        with open(f'/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet/outputs/preds_with_ids_{seed}.pkl', 'rb') as f:
             loaded_results = pickle.load(f)
 
         test_metrics = compute_metrics(loaded_results['all_labels'], loaded_results['all_preds'])
@@ -249,7 +249,7 @@ def main(**cfg):
     plt.xticks(fontsize=14)
     plt.yticks(fontsize=14)
     #plt.legend(loc = 'upper left')
-    plt.savefig("hybrid_final_model_auroc.png", bbox_inches='tight', dpi=300)
+    plt.savefig(os.path.join("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet/plots", "hybrid_final_model_auroc.png"), bbox_inches='tight', dpi=300)
 
     '''
     Calibration curves
@@ -259,7 +259,7 @@ def main(**cfg):
 
     for seed in seeds:
         print(f"Running experiment for seed: {seed}")
-        with open(f'outputs/preds_with_ids_{seed}.pkl', 'rb') as f:
+        with open(f'/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet/outputs/preds_with_ids_{seed}.pkl', 'rb') as f:
             loaded_results = pickle.load(f)
 
         test_metrics = compute_metrics(loaded_results['all_labels'], loaded_results['all_preds'])
@@ -320,7 +320,7 @@ def main(**cfg):
     plt.ylabel('True probabilities in each bin', fontsize=18)
     plt.xticks(fontsize=14)
     plt.yticks(fontsize=14)
-    plt.savefig("final_model_calibration.png", bbox_inches='tight', dpi=300)
+    plt.savefig(os.path.join("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet/plots", "final_model_calibration.png"), bbox_inches='tight', dpi=300)
 
 if __name__ == "__main__":
     main()

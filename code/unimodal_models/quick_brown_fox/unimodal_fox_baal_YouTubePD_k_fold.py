@@ -1,3 +1,7 @@
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
 import os
 import copy
 import pickle
@@ -27,10 +31,6 @@ import random
 import click
 import json
 from imblearn.over_sampling import SMOTE
- 
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
 import imblearn
 import re
 
@@ -436,7 +436,7 @@ unimodal_fox_baal.py --batch_size=1024 --corr_thr=0.95 --drop_correlated=yes
 @click.option("--patience",default=1)
 @click.option("--fold",default=4)
 def main(**cfg):
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
  

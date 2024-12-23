@@ -1,6 +1,3 @@
-'''
-Removed RL with neural layers -- weighted fusion
-'''
 import os
 import copy
 import pickle
@@ -48,9 +45,9 @@ def get_gpu_memory():
     memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
     return memory_free_values
 
-#results = get_gpu_memory()
-#gpu_id = np.argmax(results)
-#os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+results = get_gpu_memory()
+gpu_id = np.argmax(results)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -663,32 +660,25 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
     all_labels = np.asarray(all_labels).flatten()
     all_final_predictions = np.asarray(all_final_predictions).flatten()
     
-    if split=="test":
-        coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
-        all_labels = all_labels[~uncertain_indices]
-        all_final_predictions = all_final_predictions[~uncertain_indices]
+    # if split=="test":
+    #     coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
+    #     all_labels = all_labels[~uncertain_indices]
+    #     all_final_predictions = all_final_predictions[~uncertain_indices]
 
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
-    if split=="test":
-        metrics['coverage'] = coverage
+    # if split=="test":
+    #     metrics['coverage'] = coverage
 
     return metrics
 
-'''
---batch_size=1024 --dropout_prob=0.495989214406461 --gamma=0.57143922410234 --hidden_dim=512 
---increase_variance=no --last_hidden_dim=128 --learning_rate=0.020724443604128343 
---minority_oversample=no --model_subset_choice=0 --momentum=0.6897821582954526 
---num_epochs=164 --optimizer=SGD --patience=5 --query_dim=64 --random_state=357 
---sampler=SMOTE --scheduler=step --seed=423 --step_size=5 --train_random_noise=no 
---uncertainty_weight=81.81790352752515 --use_scheduler=no --validation_random_noise=no
-'''
+
 @click.command()
-@click.option("--learning_rate", default=0.020724443604128343, help="Learning rate for classifier")
-@click.option("--dropout_prob", default=0.495989214406461)
+@click.option("--learning_rate", default=0.001, help="Learning rate for classifier")
+@click.option("--dropout_prob", default=0.25)
 @click.option("--num_buckets", default=20, help="Options: 5, 10, 20, 50, 100")
 @click.option("--num_trials", default=30, help="Options: 100-1000")
-@click.option("--uncertainty_weight", default=81.81790352752515)
+@click.option("--uncertainty_weight", default=0.01)
 @click.option("--minority_oversample",default='no',help="Options: 'yes', 'no'")
 @click.option("--sampler", default='SMOTE', help="Options:SMOTE, SMOTENC, SVMSMOTE, ADASYN, BorderlineSMOTE, KMeansSMOTE, SMOTEN, RandomOverSampler, SMOTEENN, SMOTETomek")
 @click.option("--train_random_noise", default="no", help="Options: yes, no")
@@ -696,36 +686,30 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 @click.option("--increase_variance",default="no", help="Options: yes, no")
 @click.option("--temperature", default=0.05, help="Float between 0 and 1")
 @click.option("--noise_variance",default=0.01,help="Float between 0 and 1")
-@click.option("--random_state", default=357, help="Random state for classifier")
+@click.option("--random_state", default=171, help="Random state for classifier")
 @click.option("--model_subset_choice", default=0, help="4 possible choices. See Constants.py")
-@click.option("--seed", default=423, help="Seed for random")
-@click.option("--batch_size",default=1024)
-@click.option("--num_epochs",default=164)
-@click.option("--hidden_dim", default=512)
+@click.option("--seed", default=113, help="Seed for random")
+@click.option("--batch_size",default=64)
+@click.option("--num_epochs",default=244)
+@click.option("--hidden_dim", default=128)
 @click.option("--query_dim", default=64)
-@click.option("--last_hidden_dim", default=128)
-@click.option("--optimizer",default="SGD",help="Options: SGD, AdamW, RMSprop")
+@click.option("--last_hidden_dim", default=8)
+@click.option("--optimizer",default="AdamW",help="Options: SGD, AdamW, RMSprop")
 @click.option("--beta1",default=0.9)
 @click.option("--beta2",default=0.999)
 @click.option("--weight_decay",default=0.0001)
-@click.option("--momentum",default=0.6897821582954526)
-@click.option("--use_scheduler",default='no',help="Options: yes, no")
+@click.option("--momentum",default=0.5317318147195794)
+@click.option("--use_scheduler",default='yes',help="Options: yes, no")
 @click.option("--scheduler",default='reduce',help="Options: step, reduce")
-@click.option("--step_size",default=5)
-@click.option("--gamma",default=0.57143922410234)
-@click.option("--patience",default=5)
+@click.option("--step_size",default=21)
+@click.option("--gamma",default=0.34188571201807494)
+@click.option("--patience",default=6)
 def main(**cfg):
     global NUM_MODELS
 
     ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
-
-    '''
-    save the configurations obtained from wandb (or command line) into the model config file
-    '''
-    with open(MODEL_CONFIG_PATH,"w") as f:
-        f.write(json.dumps(cfg))
 
     #reproducibility control
     torch.manual_seed(cfg["seed"])
@@ -983,17 +967,6 @@ def main(**cfg):
         wandb.log(test_metrics)
         wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1, "dev_ece":best_dev_ece})
     print(test_metrics)
-
-    # '''
-    # Save best model
-    # '''
-    torch.save(best_model.to('cpu').state_dict(),MODEL_PATH)
-
-    loaded_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
-    loaded_model.load_state_dict(torch.load(MODEL_PATH))
-    loaded_model = loaded_model.to(device)
-    print("="*20)
-    print(evaluate_fusion_model(loaded_model, test_loader, prediction_models, cfg, split="test"))
 
 if __name__ == "__main__":
     main()

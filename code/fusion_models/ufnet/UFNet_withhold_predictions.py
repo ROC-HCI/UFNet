@@ -1,6 +1,3 @@
-'''
-Removed RL with neural layers -- weighted fusion
-'''
 import os
 import copy
 import pickle
@@ -11,6 +8,7 @@ import wandb
 import random
 import click
 import imblearn
+import scipy
 
 import pandas as pd
 import numpy as np
@@ -18,6 +16,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import scipy.stats as stats
 import subprocess as sp
+
+import baal.bayesian.dropout as mcdropout
+from baal.modelwrapper import ModelWrapper
 
 from pandas import DataFrame
 from tqdm import tqdm
@@ -44,9 +45,9 @@ def get_gpu_memory():
     memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
     return memory_free_values
 
-results = get_gpu_memory()
-gpu_id = np.argmax(results)
-os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+#results = get_gpu_memory()
+#gpu_id = np.argmax(results)
+#os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -61,7 +62,8 @@ with open(os.path.join(BASE_DIR,"data/test_set_participants.txt")) as f:
     ids = f.readlines()
     test_ids = set([x.strip() for x in ids])
 
-print(f"Number of patients in the test set: {len(test_ids)}")
+	
+print(f"Number of patients in the dev and test set: {len(dev_ids)}, {len(test_ids)}")
 
 #2. process the datasets
 '''
@@ -345,46 +347,41 @@ class TensorDataset(Dataset):
         return len(self.labels)
 
 '''
-baseline predictive models
+ML baselines using pytorch + BAAL
 '''
 class ANN(nn.Module):
-    def __init__(self, n_features):
+    def __init__(self, n_features, drop_prob):
         super(ANN,self).__init__()
         self.fc1 = nn.Linear(in_features=n_features, out_features=(int)(n_features/2), bias=True)
+        self.drop1 = mcdropout.Dropout(p = drop_prob)
         self.fc2 = nn.Linear(in_features=self.fc1.out_features, out_features=1,bias=True)
+        self.drop2 = mcdropout.Dropout(p = drop_prob)
         self.hidden_activation = nn.ReLU()
         self.sig = nn.Sigmoid()
 
     def forward(self,x):
         x1 = self.hidden_activation(self.fc1(x))
+        x1 = self.drop1(x1)
         y = self.fc2(x1)
+        y = self.drop2(y)
         y = self.sig(y)
         return y
 
 '''
-baseline predictive models
+ML baselines using pytorch + BAAL
 '''
 class ShallowANN(nn.Module):
-    def __init__(self, n_features):
+    def __init__(self, n_features, drop_prob):
         super(ShallowANN, self).__init__()
         self.fc = nn.Linear(in_features=n_features, out_features=1,bias=True)
+        self.drop = mcdropout.Dropout(p = drop_prob)
         self.activation = nn.ReLU()
         self.sig = nn.Sigmoid()
     def forward(self,x):
         y = self.fc(x)
+        y = self.drop(y)
         y = self.sig(y)
         return y
-
-'''
-A simple model to predict the residual error -- residual model
-'''
-class ResidualPredictor(nn.Module):
-    def __init__(self, n_features):
-        super(ResidualPredictor, self).__init__()
-        self.fc = nn.Linear(in_features=n_features+1, out_features=1, bias=True)
-        self.activation = nn.Tanh()
-    def forward(self,x):
-        return self.activation(self.fc(x))
 
 '''
 Final predictor
@@ -393,46 +390,108 @@ Contains two modules:
     2. prediction network
 '''
 class CrossAttention(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, query_dim, drop_prob, uncertainty_weight):
         super(CrossAttention, self).__init__()
-        self.softmax = nn.Softmax(dim=-1)
         self.input_dim = input_dim
+        self.query_dim = query_dim
+        self.drop_prob = drop_prob
+        self.uncertainty_weight = uncertainty_weight
+        
+        self.form_query = torch.nn.Linear(input_dim, query_dim)
+        self.form_key = torch.nn.Linear(input_dim, query_dim)
+        self.form_value = torch.nn.Linear(input_dim, query_dim)
+
+        self.drop = mcdropout.Dropout(p = drop_prob)
+        self.softmax = nn.Softmax(dim=-1)
         self.final_layer = torch.nn.Linear((NUM_MODELS-1) * self.input_dim, self.input_dim)
 
-    def forward(self, q, keys):
-        #print(f"Dimensions: q: {q.shape}, keys: {keys.shape}, key_0: {keys[0].shape}")
-        d = q.shape[1]
-        q = q.unsqueeze(dim=2) #(n, d) -> (n, d, 1)
-
-        score_q_ks = []
-        for i in range(NUM_MODELS-1):
-            score_q_k = torch.matmul(q, keys[i].unsqueeze(dim=2).transpose(-1,-2)) #(n, d, 1)*(n, 1, d) = (n, d, d)
-            score_q_k = score_q_k/math.sqrt(d) #(n,d,d)
-            score_q_ks.append(score_q_k) #-->(N,n,d,d)
-    
-        all_scores = torch.stack(score_q_ks) #(NUM_MODELS-1, n, d, d)
-        weight = self.softmax(all_scores) #(NUM_MODELS-1, n, d, d)
+    def forward(self, features, prediction_variances):
+        prediction_variances = torch.stack(prediction_variances).transpose(0,1) #(n, N)
         
-        #k1: (n, d) => torch.stack([k1, k2, ...]): (NUM_MODELS, n, d) => unsqueeze(dim=3): (NUM_MODELS, n, d, 1)
-        #(N,n,d,d)*(N,n,d,1) = (N,n,d,1) => squeeze(dim=-1): (N,n,d)
-        outputs = torch.matmul(weight, keys.unsqueeze(dim=3)).squeeze(dim=-1)
-        outputs = outputs.transpose(0,1) #(n,N,d)
-        outputs = outputs.reshape((-1, (NUM_MODELS-1)*self.input_dim)) #(n, N*d)
-        outputs = self.final_layer(outputs) #(n,d)
-        outputs = q.squeeze(dim=-1) + outputs #(n, d)
-        return outputs
-
-class LateFusionNetwork(nn.Module):
-    def __init__(self, config):
-        super(LateFusionNetwork, self).__init__()
-    
-    def forward(self, predicted_scores):
+        queries = []
+        keys = []
+        values = []
         for i in range(NUM_MODELS):
-            predicted_scores[i] = predicted_scores[i].reshape(-1,1) #(n,1)
-            predicted_scores[i] = 1.0*(predicted_scores[i]>=0.50)
+            q = self.form_query(features[i])
+            q = self.drop(q)
 
-        pred_scores = torch.cat((predicted_scores),dim=-1)
-        probs = pred_scores.mean(dim=-1)
+            key = self.form_key(features[i])
+            key = self.drop(q)
+
+            val = self.form_value(features[i])
+            val = self.drop(val)
+
+            queries.append(q)
+            keys.append(key)
+            values.append(val)
+
+        queries = torch.stack(queries) #(N, n, d)
+        queries = queries.transpose(0,1) #(n, N, d)
+        keys = torch.stack(keys) #(N, n, d)
+        keys_T = keys.transpose(0,1).transpose(-1,-2) #(n, d, N)
+        values = torch.stack(values) #(N, n, d)
+        values = values.transpose(0,1) #(n, N, d)
+
+        scores = torch.matmul(queries, keys_T) #(n, N, N)
+        #scores = self.softmax(scores) #the mid dimension sums up to 1, e.g., rows of scores[0]
+
+        vars = prediction_variances.repeat(1, NUM_MODELS).reshape(-1, NUM_MODELS, NUM_MODELS) #(n, N, N)
+        vars = vars + prediction_variances.unsqueeze(dim=-1) #(n, N, N)
+        scores = scores - self.uncertainty_weight*vars #(n, N, N)
+        scores = self.softmax(scores)
+        
+        zs = torch.matmul(scores, values) #(n, N, d)
+        z = zs.reshape((-1, NUM_MODELS*self.query_dim)) #(n, N*d)
+        return z
+
+class HybridFusionNetworkWithUncertainty(nn.Module):
+    def __init__(self, feature_shapes, config):
+        super(HybridFusionNetworkWithUncertainty, self).__init__()
+        self.hidden_dim = config["hidden_dim"]
+        self.query_dim = config["query_dim"]
+        self.last_hidden_dim = config["last_hidden_dim"]
+        self.drop_prob = config["dropout_prob"]
+        self.uncertainty_weight = config["uncertainty_weight"]
+        '''
+        input: features_i is of shape (feature_shapes[i]); y_pred_score_i
+        total input size: feature_shapes[i]+1
+        '''
+        self.intra_linear = nn.ModuleList()
+        self.layer_norm = nn.LayerNorm(self.hidden_dim)
+        self.cross_attention = CrossAttention(self.hidden_dim, self.query_dim, self.drop_prob, self.uncertainty_weight) #shared weights
+
+        for i in range(NUM_MODELS):
+            linear_layer = nn.Linear(in_features=feature_shapes[i], out_features=self.hidden_dim, bias=True)
+            self.intra_linear.append(linear_layer)
+
+        self.lin1 = nn.Linear(in_features=((NUM_MODELS*self.query_dim)+NUM_MODELS), out_features=self.last_hidden_dim)
+        self.fc = nn.Linear(in_features=self.last_hidden_dim, out_features=1)
+        self.softmax = nn.Softmax(dim=-1)
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU()
+
+        self.intra_linear_dropout = mcdropout.Dropout(p = self.drop_prob)
+        self.lin1_dropout = mcdropout.Dropout(p = self.drop_prob)
+    
+    def forward(self, inputs):
+        (features, predicted_scores, prediction_variances) = inputs
+        # print([features[i].shape for i in range(len(features))]) #(n, 232), (n, 1024), (n, 42)
+        
+        hiddens = []
+        for i in range(NUM_MODELS):
+            hidden_representation = self.relu(self.intra_linear[i](features[i])) #projection: (n, d_{x_i}) -> (n,d)
+            hidden_representation = self.intra_linear_dropout(hidden_representation)
+            hidden_representation = self.relu(hidden_representation)
+            hidden_representation = self.layer_norm(hidden_representation)
+            hiddens.append(hidden_representation)
+
+        pred_scores = torch.stack(predicted_scores).transpose(0,1) #(n, N)
+        context = self.cross_attention(torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS)]), prediction_variances) #(n, d_q)
+        outputs = torch.cat((context, pred_scores),dim=-1) #(n, N+d_q)
+        outputs = self.lin1(outputs) #(n, last_hidden_dim)
+        outputs = self.lin1_dropout(outputs) 
+        logits = self.fc(outputs) #(n,1)
+        probs = self.sigmoid(logits) #(n,1)
         return probs
 
 '''
@@ -543,19 +602,27 @@ def compute_metrics(y_true, y_pred_scores, threshold = 0.5):
 Main evaluation loop to test the fusion model
 '''
 def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev"):
+    fusion_model.eval()
+    z_critical = scipy.stats.t.ppf(q=0.975, df = config["num_trials"]-1)
+
     all_labels = [] #true labels
     all_pred_scores = [[] for i in range(NUM_MODELS)] #unimodal prediction scores
     all_final_predictions = [] #fusion predictions
+    uncertain_indices = [] #indices where the 95% CI contains 0.5
     loss = 0 #average loss
     n_samples = 0 #number of examples in the dataloader
 
     criterion = torch.nn.BCELoss() #loss function
+    wrapped_prediction_models = [ModelWrapper(prediction_models[i],criterion) for i in range(NUM_MODELS)]
+    fusion_model.eval()
+    wrapped_fusion_model = ModelWrapper(fusion_model, criterion)
     
     for idx, batch in enumerate(dataloader):
         x = [[] for i in range(NUM_MODELS)] #[x0, x1, ..., xn]
         y_pred_scores = [[] for i in range(NUM_MODELS)] #probs[y0, y1, ..., yn]
         y_preds = [[] for i in range(NUM_MODELS)] #binary[y0, y1, ..., yn]
-
+        y_vars = [[] for i in range(NUM_MODELS)]
+        
         (x, y) = batch
         y = y.to(device)
 
@@ -567,29 +634,36 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
                 adjusted_noise = noise*config["noise_variance"]
                 x[i] += adjusted_noise
 
-            y_pred_scores[i] = prediction_models[i](x[i]).reshape(-1)
+            y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=config["num_trials"])
+            y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
+            y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
             y_preds[i] = (y_pred_scores[i]>=0.5)
-
             all_pred_scores[i].extend(y_pred_scores[i].to('cpu').numpy())
 
         all_labels.extend(y.to('cpu').numpy())
         
         #forward pass
         with torch.no_grad():
-            final_pred_scores = fusion_model(y_pred_scores) #(n,)
+            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=config["num_trials"])
+            standard_error = (z_critical*final_pred_scores.std(dim=-1).reshape(-1))/math.sqrt(len(final_pred_scores))
+            final_pred_scores = final_pred_scores.mean(dim=-1).reshape(-1)
+            index_mask = (final_pred_scores-standard_error<=0.50) & (final_pred_scores+standard_error>=0.50)
             n = final_pred_scores.shape[0]
             loss += criterion(final_pred_scores.reshape(-1), y)*n
             n_samples+=n
         
         all_final_predictions.extend(final_pred_scores.cpu().numpy())
+        uncertain_indices.extend(index_mask.cpu().numpy())
 
-    all_labels = np.asarray(all_labels)
-    all_final_predictions = np.asarray(all_final_predictions)
+    #evaluate
+    uncertain_indices = np.asarray(uncertain_indices).flatten()
+    all_labels = np.asarray(all_labels).flatten()
+    all_final_predictions = np.asarray(all_final_predictions).flatten()
+    
     if split=="test":
-        index_mask = (all_final_predictions>=0.45) & (all_final_predictions<=0.55)
-        coverage = (len(all_labels) - index_mask.sum())/len(all_labels)
-        all_labels = all_labels[~index_mask]
-        all_final_predictions = all_final_predictions[~index_mask]
+        coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
+        all_labels = all_labels[~uncertain_indices]
+        all_final_predictions = all_final_predictions[~uncertain_indices]
 
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
@@ -599,46 +673,56 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
     return metrics
 
 '''
-Choice 0
---batch_size=512 --gamma=0.9110710830544324 --hidden_dim=128 --increase_variance=yes 
---last_hidden_dim=4 --learning_rate=0.1475797791963295 --minority_oversample=no 
---model_subset_choice=7 --momentum=0.4432220223030554 --noise_variance=0.565011755638535 
---num_epochs=262 --optimizer=AdamW --patience=11 --random_state=813 --sampler=RandomOverSampler 
---scheduler=reduce --seed=702 --step_size=13 --temperature=0.5059772368291524 
---train_random_noise=no --use_scheduler=no --validation_random_noise=no
+--batch_size=1024 --dropout_prob=0.495989214406461 --gamma=0.57143922410234 --hidden_dim=512 
+--increase_variance=no --last_hidden_dim=128 --learning_rate=0.020724443604128343 
+--minority_oversample=no --model_subset_choice=0 --momentum=0.6897821582954526 
+--num_epochs=164 --optimizer=SGD --patience=5 --query_dim=64 --random_state=357 
+--sampler=SMOTE --scheduler=step --seed=423 --step_size=5 --train_random_noise=no 
+--uncertainty_weight=81.81790352752515 --use_scheduler=no --validation_random_noise=no
 '''
 @click.command()
-@click.option("--learning_rate", default=0.1475797791963295, help="Learning rate for classifier")
+@click.option("--learning_rate", default=0.020724443604128343, help="Learning rate for classifier")
+@click.option("--dropout_prob", default=0.495989214406461)
+@click.option("--num_buckets", default=20, help="Options: 5, 10, 20, 50, 100")
+@click.option("--num_trials", default=30, help="Options: 100-1000")
+@click.option("--uncertainty_weight", default=81.81790352752515)
 @click.option("--minority_oversample",default='no',help="Options: 'yes', 'no'")
-@click.option("--sampler", default='RandomOverSampler', help="Options:SMOTE, SMOTENC, SVMSMOTE, ADASYN, BorderlineSMOTE, KMeansSMOTE, SMOTEN, RandomOverSampler, SMOTEENN, SMOTETomek")
+@click.option("--sampler", default='SMOTE', help="Options:SMOTE, SMOTENC, SVMSMOTE, ADASYN, BorderlineSMOTE, KMeansSMOTE, SMOTEN, RandomOverSampler, SMOTEENN, SMOTETomek")
 @click.option("--train_random_noise", default="no", help="Options: yes, no")
 @click.option("--validation_random_noise", default="no", help="Options: yes, no")
 @click.option("--increase_variance",default="no", help="Options: yes, no")
-@click.option("--temperature", default=0.5059772368291524, help="Float between 0 and 1")
-@click.option("--noise_variance",default=0.565011755638535,help="Float between 0 and 1")
-@click.option("--random_state", default=813, help="Random state for classifier")
-@click.option("--model_subset_choice", default=0, help="17 possible choices. See Constants.py")
-@click.option("--seed", default=702, help="Seed for random")
-@click.option("--batch_size",default=512)
-@click.option("--num_epochs",default=262)
-@click.option("--hidden_dim", default=128)
-@click.option("--last_hidden_dim", default=4)
-@click.option("--optimizer",default="AdamW",help="Options: SGD, AdamW, RMSprop")
+@click.option("--temperature", default=0.05, help="Float between 0 and 1")
+@click.option("--noise_variance",default=0.01,help="Float between 0 and 1")
+@click.option("--random_state", default=357, help="Random state for classifier")
+@click.option("--model_subset_choice", default=0, help="4 possible choices. See Constants.py")
+@click.option("--seed", default=423, help="Seed for random")
+@click.option("--batch_size",default=1024)
+@click.option("--num_epochs",default=164)
+@click.option("--hidden_dim", default=512)
+@click.option("--query_dim", default=64)
+@click.option("--last_hidden_dim", default=128)
+@click.option("--optimizer",default="SGD",help="Options: SGD, AdamW, RMSprop")
 @click.option("--beta1",default=0.9)
 @click.option("--beta2",default=0.999)
 @click.option("--weight_decay",default=0.0001)
-@click.option("--momentum",default=0.4432220223030554)
+@click.option("--momentum",default=0.6897821582954526)
 @click.option("--use_scheduler",default='no',help="Options: yes, no")
 @click.option("--scheduler",default='reduce',help="Options: step, reduce")
-@click.option("--step_size",default=13)
-@click.option("--gamma",default=0.9110710830544324)
-@click.option("--patience",default=11)
+@click.option("--step_size",default=5)
+@click.option("--gamma",default=0.57143922410234)
+@click.option("--patience",default=5)
 def main(**cfg):
     global NUM_MODELS
 
     ENABLE_WANDB = False
     if ENABLE_WANDB:
-        wandb.init(project="fusion_statistics", config=cfg)
+        wandb.init(project="park_final_experiments", config=cfg)
+
+    '''
+    save the configurations obtained from wandb (or command line) into the model config file
+    '''
+    with open(MODEL_CONFIG_PATH,"w") as f:
+        f.write(json.dumps(cfg))
 
     #reproducibility control
     torch.manual_seed(cfg["seed"])
@@ -721,7 +805,7 @@ def main(**cfg):
     df = df.rename(columns={"label_0":"label", "id_0":"id"})
     
     print("Data of finger tapping, audio, and smile is combined and loaded.")
-
+    
     train_df, test_df = train_test_split(df)
     train_df, dev_df = train_dev_split(train_df)
     
@@ -773,13 +857,13 @@ def main(**cfg):
             predictor_config = json.load(json_file)
 
         if predictor_config["model"]=="ShallowANN":    
-            frozen_model = ShallowANN(feature_shapes[i])
+            frozen_model = ShallowANN(feature_shapes[i], drop_prob = predictor_config["dropout_prob"])
             frozen_model.load_state_dict(torch.load(model_paths[i]["PREDICTOR_MODEL"]))
             frozen_model = frozen_model.to(device)
             frozen_model.fc.weight.requires_grad = False
             frozen_model.fc.bias.requires_grad = False
         else:
-            frozen_model = ANN(feature_shapes[i])
+            frozen_model = ANN(feature_shapes[i], drop_prob = predictor_config["dropout_prob"])
             frozen_model.load_state_dict(torch.load(model_paths[i]["PREDICTOR_MODEL"]))
             frozen_model = frozen_model.to(device)
             frozen_model.fc1.weight.requires_grad = False
@@ -790,17 +874,123 @@ def main(**cfg):
         prediction_models.append(frozen_model)
 
     print("All the prediction models are loaded as frozen.")
-    
-    fusion_model = LateFusionNetwork(cfg)
+
+    fusion_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
     fusion_model = fusion_model.to(device)
     
+    criterion = nn.BCELoss()
+    if cfg["optimizer"]=="AdamW":
+        optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
+    elif cfg["optimizer"]=="SGD":
+        optimizer = torch.optim.SGD(fusion_model.parameters(),lr=cfg['learning_rate'],momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
+    elif cfg["optimizer"]=="RMSprop":
+        optimizer = torch.optim.RMSprop(fusion_model.parameters(), lr=cfg['learning_rate'], momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
+    else:
+        raise ValueError("Invalid optimizer")
+
+    if cfg["use_scheduler"]=="yes":
+        if cfg['scheduler']=="step":
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg['step_size'], gamma=cfg['gamma'])
+        elif cfg['scheduler']=="reduce":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=cfg['gamma'], patience = cfg['patience'])
+        else:
+            raise ValueError("Invalid scheduler")
+
     best_model = copy.deepcopy(fusion_model)
+    best_dev_loss = np.finfo('float32').max
+    best_dev_accuracy = 0
+    best_dev_balanced_accuracy = 0
+    best_dev_auroc = 0
+    best_dev_f1 = 0
+    wrapped_prediction_models = [ModelWrapper(prediction_models[i],criterion) for i in range(NUM_MODELS)]
+
+    epoch_no = 0
+
+    for epoch in tqdm(range(cfg['num_epochs'])):
+        noise_variance = 0.0
+        if (cfg["train_random_noise"]=="yes") and (cfg["increase_variance"]=="yes"):
+            noise_variance = cfg["noise_variance"]*(1-math.exp(-epoch_no*cfg["temperature"]))
+            epoch_no +=1
+
+        all_labels = []
+        all_pred_scores = [[] for i in range(NUM_MODELS)]
+        
+        for idx, batch in enumerate(train_loader):
+            x = [[] for i in range(NUM_MODELS)]
+            (x, y) = batch
+            y = y.to(device)
+            y_pred_scores = [[] for i in range(NUM_MODELS)]
+            y_preds = [[] for i in range(NUM_MODELS)]
+            y_vars = [[] for i in range(NUM_MODELS)]
+            
+            for i in range(NUM_MODELS):
+                x[i] = x[i].to(device)
+                if cfg["train_random_noise"]=="yes":
+                    noise = torch.randn(x[i].shape).to(device)
+                    adjusted_noise = noise*noise_variance
+                    x[i] += adjusted_noise
+                
+                y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=cfg["num_trials"])
+                y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
+                y_preds[i] = (y_pred_scores[i]>=0.5)
+                y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
+                
+                all_pred_scores[i].extend(y_pred_scores[i].to('cpu').numpy())
+
+            all_labels.extend(y.to('cpu').numpy())
+            
+            #forward pass
+            optimizer.zero_grad()
+            final_predictions = fusion_model((x,y_pred_scores, y_vars))
+            l = criterion(final_predictions.reshape(-1),y)
+            l.backward()
+            optimizer.step()
+
+            if ENABLE_WANDB:
+                wandb.log({"train_loss": l.to('cpu').item()})
+
+        #eval on dev set
+        dev_metrics = evaluate_fusion_model(fusion_model, dev_loader, prediction_models, cfg)
+        dev_loss = dev_metrics["loss"]
+        dev_accuracy = dev_metrics["accuracy"]
+        dev_balanced_accuracy = dev_metrics["weighted_accuracy"]
+        dev_auroc = dev_metrics["auroc"]
+        dev_f1 = dev_metrics["f1_score"]
+        dev_ece = dev_metrics["ECE"]
+        #print(f"Epoch {epoch}: dev accuracy: {dev_metrics['accuracy']}")
+
+        if cfg['use_scheduler']=="yes":
+            if cfg['scheduler']=='step':
+                scheduler.step()
+            else:
+                scheduler.step(dev_loss)
+
+        if dev_loss<best_dev_loss:
+            best_model = copy.deepcopy(fusion_model)
+
+            best_dev_loss = dev_loss
+            best_dev_accuracy = dev_accuracy
+            best_dev_balanced_accuracy = dev_balanced_accuracy
+            best_dev_auroc = dev_auroc
+            best_dev_f1 = dev_f1
+            best_dev_ece = dev_ece
 
     test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test")
     if ENABLE_WANDB:
         wandb.log(test_metrics)
-
+        wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1, "dev_ece":best_dev_ece})
     print(test_metrics)
+
+    # '''
+    # Save best model
+    # '''
+    torch.save(best_model.to('cpu').state_dict(),MODEL_PATH)
+
+    loaded_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
+    loaded_model.load_state_dict(torch.load(MODEL_PATH))
+    loaded_model = loaded_model.to(device)
+    print("="*20)
+    print(evaluate_fusion_model(loaded_model, test_loader, prediction_models, cfg, split="test"))
 
 if __name__ == "__main__":
     main()

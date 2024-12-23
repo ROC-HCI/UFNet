@@ -1,6 +1,6 @@
 import os
 
-BASE_DIR = os.getcwd()+"/../../../"
+BASE_DIR = "/localdisk1/PARK/ufnet_aaai/UFNet"
 
 FINGER_FEATURES_FILE = os.path.join(BASE_DIR,"data/finger_tapping/features_demography_diagnosis_Nov22_2023.csv")
 AUDIO_FEATURES_FILE = os.path.join(BASE_DIR,"data/quick_brown_fox/wavlm_fox_features.csv")

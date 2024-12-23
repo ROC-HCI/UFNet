@@ -1,3 +1,4 @@
+import torch
 import os
 import copy
 import pickle
@@ -28,7 +29,6 @@ import re
 import imblearn
 from imblearn.over_sampling import SMOTE
 
-import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
@@ -450,7 +450,7 @@ def concat_features(row):
 @click.option("--gamma",default=0.683941938387959)
 @click.option("--patience",default=13)
 def main(**cfg):
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
     

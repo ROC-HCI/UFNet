@@ -395,7 +395,7 @@ def evaluate(model, dataloader):
 @click.option("--patience",default=4)
 @click.option("--video_model", default='TimeSformer', help="Options: VideoMAE, TimeSformer, Uniformer, ViViT")
 def main(**cfg):
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_rebuttal_experiments", config=cfg)
 

@@ -33,6 +33,8 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/")
 from constants import *
 
 '''
@@ -375,64 +377,28 @@ class ShallowANN(nn.Module):
         y = self.sig(y)
         return y
 
-'''
-A simple model to predict the residual error -- residual model
-'''
-class ResidualPredictor(nn.Module):
-    def __init__(self, n_features):
-        super(ResidualPredictor, self).__init__()
-        self.fc = nn.Linear(in_features=n_features+1, out_features=1, bias=True)
-        self.activation = nn.Tanh()
-    def forward(self,x):
-        return self.activation(self.fc(x))
-
-'''
-Final predictor
-Contains two modules:
-    1. a custom cross-attention module
-    2. prediction network
-'''
-class CrossAttention(nn.Module):
-    def __init__(self, input_dim):
-        super(CrossAttention, self).__init__()
+class HybridFusionNetwork(nn.Module):
+    def __init__(self, feature_shapes, config):
+        super(HybridFusionNetwork, self).__init__()
+        self.hidden_dim = config["hidden_dim"]
+        self.last_hidden_dim = config["last_hidden_dim"]
+        feature_size = np.sum([feature_shapes[i] for i in range(NUM_MODELS)])
+        self.lin1 = nn.Linear(in_features=(feature_size+NUM_MODELS), out_features=self.last_hidden_dim)
+        self.fc = nn.Linear(in_features=self.last_hidden_dim, out_features=1)
         self.softmax = nn.Softmax(dim=-1)
-        self.input_dim = input_dim
-        self.final_layer = torch.nn.Linear((NUM_MODELS-1) * self.input_dim, self.input_dim)
-
-    def forward(self, q, keys):
-        #print(f"Dimensions: q: {q.shape}, keys: {keys.shape}, key_0: {keys[0].shape}")
-        d = q.shape[1]
-        q = q.unsqueeze(dim=2) #(n, d) -> (n, d, 1)
-
-        score_q_ks = []
-        for i in range(NUM_MODELS-1):
-            score_q_k = torch.matmul(q, keys[i].unsqueeze(dim=2).transpose(-1,-2)) #(n, d, 1)*(n, 1, d) = (n, d, d)
-            score_q_k = score_q_k/math.sqrt(d) #(n,d,d)
-            score_q_ks.append(score_q_k) #-->(N,n,d,d)
+        self.sigmoid = nn.Sigmoid()
+        self.relu = nn.ReLU()
     
-        all_scores = torch.stack(score_q_ks) #(NUM_MODELS-1, n, d, d)
-        weight = self.softmax(all_scores) #(NUM_MODELS-1, n, d, d)
-        
-        #k1: (n, d) => torch.stack([k1, k2, ...]): (NUM_MODELS, n, d) => unsqueeze(dim=3): (NUM_MODELS, n, d, 1)
-        #(N,n,d,d)*(N,n,d,1) = (N,n,d,1) => squeeze(dim=-1): (N,n,d)
-        outputs = torch.matmul(weight, keys.unsqueeze(dim=3)).squeeze(dim=-1)
-        outputs = outputs.transpose(0,1) #(n,N,d)
-        outputs = outputs.reshape((-1, (NUM_MODELS-1)*self.input_dim)) #(n, N*d)
-        outputs = self.final_layer(outputs) #(n,d)
-        outputs = q.squeeze(dim=-1) + outputs #(n, d)
-        return outputs
-
-class LateFusionNetwork(nn.Module):
-    def __init__(self, config):
-        super(LateFusionNetwork, self).__init__()
-    
-    def forward(self, predicted_scores):
+    def forward(self, features, predicted_scores):
         for i in range(NUM_MODELS):
             predicted_scores[i] = predicted_scores[i].reshape(-1,1) #(n,1)
-            predicted_scores[i] = 1.0*(predicted_scores[i]>=0.50)
-
-        pred_scores = torch.cat((predicted_scores),dim=-1)
-        probs = pred_scores.mean(dim=-1)
+        
+        pred_scores = torch.cat((predicted_scores), dim=-1)
+        features = torch.cat([features[k] for k in range(NUM_MODELS)], dim=-1)
+        inputs = torch.cat((features, pred_scores), dim=-1)
+        outputs = self.lin1(inputs) #(n, last_hidden_dim)
+        logits = self.fc(outputs) #(n,1)
+        probs = self.sigmoid(logits) #(n,1)
         return probs
 
 '''
@@ -576,7 +542,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         
         #forward pass
         with torch.no_grad():
-            final_pred_scores = fusion_model(y_pred_scores) #(n,)
+            final_pred_scores = fusion_model(x, y_pred_scores) #(n,)
             n = final_pred_scores.shape[0]
             loss += criterion(final_pred_scores.reshape(-1), y)*n
             n_samples+=n
@@ -629,7 +595,7 @@ def main(**cfg):
 
     ENABLE_WANDB = False
     if ENABLE_WANDB:
-        wandb.init(project="fusion_statistics", config=cfg)
+        wandb.init(project="park_final_experiments", config=cfg)
 
     #reproducibility control
     torch.manual_seed(cfg["seed"])
@@ -782,15 +748,104 @@ def main(**cfg):
 
     print("All the prediction models are loaded as frozen.")
     
-    fusion_model = LateFusionNetwork(cfg)
+    fusion_model = HybridFusionNetwork(feature_shapes, cfg)
     fusion_model = fusion_model.to(device)
     
+    criterion = nn.BCELoss()
+    if cfg["optimizer"]=="AdamW":
+        optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
+    elif cfg["optimizer"]=="SGD":
+        optimizer = torch.optim.SGD(fusion_model.parameters(),lr=cfg['learning_rate'],momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
+    elif cfg["optimizer"]=="RMSprop":
+        optimizer = torch.optim.RMSprop(fusion_model.parameters(), lr=cfg['learning_rate'], momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
+    else:
+        raise ValueError("Invalid optimizer")
+
+    if cfg["use_scheduler"]=="yes":
+        if cfg['scheduler']=="step":
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg['step_size'], gamma=cfg['gamma'])
+        elif cfg['scheduler']=="reduce":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=cfg['gamma'], patience = cfg['patience'])
+        else:
+            raise ValueError("Invalid scheduler")
+
     best_model = copy.deepcopy(fusion_model)
+    best_dev_loss = np.finfo('float32').max
+    best_dev_accuracy = 0
+    best_dev_balanced_accuracy = 0
+    best_dev_auroc = 0
+    best_dev_f1 = 0
+
+    epoch_no = 0
+
+    for epoch in tqdm(range(cfg['num_epochs'])):
+        noise_variance = 0.0
+        if (cfg["train_random_noise"]=="yes") and (cfg["increase_variance"]=="yes"):
+            noise_variance = cfg["noise_variance"]*(1-math.exp(-epoch_no*cfg["temperature"]))
+            epoch_no +=1
+
+        all_labels = []
+        all_pred_scores = [[] for i in range(NUM_MODELS)]
+        
+        for idx, batch in enumerate(train_loader):
+            x = [[] for i in range(NUM_MODELS)]
+            (x, y) = batch
+            y = y.to(device)
+            y_pred_scores = [[] for i in range(NUM_MODELS)]
+            y_preds = [[] for i in range(NUM_MODELS)]
+            
+            for i in range(NUM_MODELS):
+                x[i] = x[i].to(device)
+                if cfg["train_random_noise"]=="yes":
+                    noise = torch.randn(x[i].shape).to(device)
+                    adjusted_noise = noise*noise_variance
+                    x[i] += adjusted_noise
+
+                y_pred_scores[i] = prediction_models[i](x[i]).reshape(-1)
+                y_preds[i] = (y_pred_scores[i]>=0.5)
+
+                all_pred_scores[i].extend(y_pred_scores[i].to('cpu').numpy())
+                
+            all_labels.extend(y.to('cpu').numpy())
+            
+            #forward pass
+            optimizer.zero_grad()
+            final_predictions = fusion_model(x, y_pred_scores)
+            l = criterion(final_predictions.reshape(-1),y)
+            l.backward()
+            optimizer.step()
+
+            if ENABLE_WANDB:
+                wandb.log({"train_loss": l.to('cpu').item()})
+
+        #eval on dev set
+        dev_metrics = evaluate_fusion_model(fusion_model, dev_loader, prediction_models, cfg)
+        dev_loss = dev_metrics["loss"]
+        dev_accuracy = dev_metrics["accuracy"]
+        dev_balanced_accuracy = dev_metrics["weighted_accuracy"]
+        dev_auroc = dev_metrics["auroc"]
+        dev_f1 = dev_metrics["f1_score"]
+        #print(f"Epoch {epoch}: dev accuracy: {dev_metrics['accuracy']}")
+
+        if cfg['use_scheduler']=="yes":
+            if cfg['scheduler']=='step':
+                scheduler.step()
+            else:
+                scheduler.step(dev_loss)
+
+        if dev_loss<best_dev_loss:
+            best_model = copy.deepcopy(fusion_model)
+
+            best_dev_loss = dev_loss
+            best_dev_accuracy = dev_accuracy
+            best_dev_balanced_accuracy = dev_balanced_accuracy
+            best_dev_auroc = dev_auroc
+            best_dev_f1 = dev_f1
 
     test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test")
     if ENABLE_WANDB:
         wandb.log(test_metrics)
-
+        wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1})
     print(test_metrics)
 
 if __name__ == "__main__":

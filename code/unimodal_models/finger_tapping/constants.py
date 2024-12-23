@@ -1,8 +1,6 @@
 import os
 
-#current dir: /localdisk1/PARK/park_multitask_fusion/code/unimodal_models/finger_tapping/
-BASE_DIR = os.getcwd()+"/../../../"
-#base dir: /localdisk1/PARK/park_multitask_fusion/
+BASE_DIR = "/localdisk1/PARK/ufnet_aaai/UFNet/"
 
 FEATURES_FILE = os.path.join(BASE_DIR,"data/finger_tapping/features_demography_diagnosis_Nov22_2023.csv")
 

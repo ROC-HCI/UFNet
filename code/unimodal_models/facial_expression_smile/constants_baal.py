@@ -1,6 +1,6 @@
 import os
 
-BASE_PATH = os.getcwd()+"/../../../"
+BASE_PATH = "/localdisk1/PARK/ufnet_aaai/UFNet/"
 BASE_DIR = BASE_PATH
 
 FACIAL_EXPRESSIONS = {

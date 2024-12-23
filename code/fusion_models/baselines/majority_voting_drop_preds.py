@@ -1,6 +1,3 @@
-'''
-Removed RL with neural layers -- weighted fusion
-'''
 import os
 import copy
 import pickle
@@ -33,6 +30,8 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/")
 from constants import *
 
 '''
@@ -422,54 +421,17 @@ class CrossAttention(nn.Module):
         outputs = q.squeeze(dim=-1) + outputs #(n, d)
         return outputs
 
-class EarlyFusionNetwork(nn.Module):
-    def __init__(self, feature_shapes, config):
-        super(EarlyFusionNetwork, self).__init__()
-        self.hidden_dim = config["hidden_dim"]
-        self.last_hidden_dim = config["last_hidden_dim"]
-        '''
-        input: features_i is of shape (feature_shapes[i]); y_pred_score_i
-        total input size: feature_shapes[i]+1
-        '''
-        self.intra_linear = nn.ModuleList()
-        self.layer_norm = nn.LayerNorm(self.hidden_dim)
-        #self.cross_attention = CrossAttention(self.hidden_dim) #shared weights
-
-        for i in range(NUM_MODELS):
-            linear_layer = nn.Linear(in_features=feature_shapes[i], out_features=self.hidden_dim, bias=True)
-            self.intra_linear.append(linear_layer)
-
-        self.lin1 = nn.Linear(in_features=NUM_MODELS*(self.hidden_dim), out_features=self.last_hidden_dim)
-        self.fc = nn.Linear(in_features=self.last_hidden_dim, out_features=1)
-        self.softmax = nn.Softmax(dim=-1)
-        self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU()
+class LateFusionNetwork(nn.Module):
+    def __init__(self, config):
+        super(LateFusionNetwork, self).__init__()
     
-    def forward(self, features):
-        
-        hiddens = []
+    def forward(self, predicted_scores):
         for i in range(NUM_MODELS):
-            hidden_representation = self.relu(self.intra_linear[i](features[i])) #projection: (n, d_{x_i}) -> (n,d)
-            hidden_representation = self.layer_norm(hidden_representation)
-            hiddens.append(hidden_representation)
+            predicted_scores[i] = predicted_scores[i].reshape(-1,1) #(n,1)
+            predicted_scores[i] = 1.0*(predicted_scores[i]>=0.50)
 
-        # contexts = []
-        # for i in range(NUM_MODELS):
-        #     #print(f"Shapes passed to x-attention: {hiddens[i].shape}, {torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS) if k!=i]).shape}")
-        #     context = self.cross_attention(hiddens[i], torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS) if k!=i])) #(n,d)
-        #     context = self.layer_norm(context)
-        #     #print(context.shape)
-        #     contexts.append(context)
-        contexts = hiddens
-
-        #(n, NUM_MODELS*d)
-        attention_vecs = torch.cat((contexts),dim=-1)
-        #pred_scores = torch.cat((predicted_scores),dim=-1)
-        #outputs = torch.cat((attention_vecs, pred_scores),dim=-1)
-        #outputs = self.relu(self.lin1(outputs)) #(n, last_hidden_dim)
-        outputs = self.lin1(attention_vecs) #(n, last_hidden_dim)
-        logits = self.fc(outputs) #(n,1)
-        probs = self.sigmoid(logits) #(n,1)
+        pred_scores = torch.cat((predicted_scores),dim=-1)
+        probs = pred_scores.mean(dim=-1)
         return probs
 
 '''
@@ -579,17 +541,20 @@ def compute_metrics(y_true, y_pred_scores, threshold = 0.5):
 '''
 Main evaluation loop to test the fusion model
 '''
-def evaluate_fusion_model(fusion_model, dataloader, config, split="dev"):
+def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev"):
     all_labels = [] #true labels
+    all_pred_scores = [[] for i in range(NUM_MODELS)] #unimodal prediction scores
     all_final_predictions = [] #fusion predictions
     loss = 0 #average loss
     n_samples = 0 #number of examples in the dataloader
 
     criterion = torch.nn.BCELoss() #loss function
-    fusion_model.eval()
+    
     for idx, batch in enumerate(dataloader):
         x = [[] for i in range(NUM_MODELS)] #[x0, x1, ..., xn]
-        
+        y_pred_scores = [[] for i in range(NUM_MODELS)] #probs[y0, y1, ..., yn]
+        y_preds = [[] for i in range(NUM_MODELS)] #binary[y0, y1, ..., yn]
+
         (x, y) = batch
         y = y.to(device)
 
@@ -601,22 +566,36 @@ def evaluate_fusion_model(fusion_model, dataloader, config, split="dev"):
                 adjusted_noise = noise*config["noise_variance"]
                 x[i] += adjusted_noise
 
+            y_pred_scores[i] = prediction_models[i](x[i]).reshape(-1)
+            y_preds[i] = (y_pred_scores[i]>=0.5)
+
+            all_pred_scores[i].extend(y_pred_scores[i].to('cpu').numpy())
+
         all_labels.extend(y.to('cpu').numpy())
         
         #forward pass
         with torch.no_grad():
-            final_pred_scores = fusion_model(x) #(n,)
+            final_pred_scores = fusion_model(y_pred_scores) #(n,)
             n = final_pred_scores.shape[0]
             loss += criterion(final_pred_scores.reshape(-1), y)*n
             n_samples+=n
         
         all_final_predictions.extend(final_pred_scores.cpu().numpy())
 
-    #evaluate
+    all_labels = np.asarray(all_labels)
+    all_final_predictions = np.asarray(all_final_predictions)
+    if split=="test":
+        index_mask = (all_final_predictions>=0.45) & (all_final_predictions<=0.55)
+        coverage = (len(all_labels) - index_mask.sum())/len(all_labels)
+        all_labels = all_labels[~index_mask]
+        all_final_predictions = all_final_predictions[~index_mask]
+
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
-    return metrics
+    if split=="test":
+        metrics['coverage'] = coverage
 
+    return metrics
 
 '''
 Choice 0
@@ -656,9 +635,9 @@ Choice 0
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
-        wandb.init(project="park_final_experiments", config=cfg)
+        wandb.init(project="fusion_statistics", config=cfg)
 
     #reproducibility control
     torch.manual_seed(cfg["seed"])
@@ -681,6 +660,7 @@ def main(**cfg):
         path = {}
         MODEL_TAG = selected_models[i]
         path["PREDICTOR_CONFIG"] = os.path.join(MODEL_BASE_PATH, MODEL_TAG,"predictive_model/model_config.json")
+        path["PREDICTOR_MODEL"] = os.path.join(MODEL_BASE_PATH, MODEL_TAG,"predictive_model/model.pth")
         path["SCALER"] = os.path.join(MODEL_BASE_PATH, MODEL_TAG,"scaler/scaler.pth")
         model_paths.append(path)
 
@@ -785,96 +765,40 @@ def main(**cfg):
     features, label = train_dataset[0]
     feature_shapes = [features[i].shape[0] for i in range(NUM_MODELS)]
     
-    fusion_model = EarlyFusionNetwork(feature_shapes, cfg)
+    prediction_models = []
+    for i in range(NUM_MODELS):
+        predictor_config = {}
+        with open(model_paths[i]["PREDICTOR_CONFIG"]) as json_file:
+            predictor_config = json.load(json_file)
+
+        if predictor_config["model"]=="ShallowANN":    
+            frozen_model = ShallowANN(feature_shapes[i])
+            frozen_model.load_state_dict(torch.load(model_paths[i]["PREDICTOR_MODEL"]))
+            frozen_model = frozen_model.to(device)
+            frozen_model.fc.weight.requires_grad = False
+            frozen_model.fc.bias.requires_grad = False
+        else:
+            frozen_model = ANN(feature_shapes[i])
+            frozen_model.load_state_dict(torch.load(model_paths[i]["PREDICTOR_MODEL"]))
+            frozen_model = frozen_model.to(device)
+            frozen_model.fc1.weight.requires_grad = False
+            frozen_model.fc1.bias.requires_grad = False
+            frozen_model.fc2.weight.requires_grad = False
+            frozen_model.fc2.bias.requires_grad = False
+
+        prediction_models.append(frozen_model)
+
+    print("All the prediction models are loaded as frozen.")
+    
+    fusion_model = LateFusionNetwork(cfg)
     fusion_model = fusion_model.to(device)
     
-    criterion = nn.BCELoss()
-    if cfg["optimizer"]=="AdamW":
-        optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
-    elif cfg["optimizer"]=="SGD":
-        optimizer = torch.optim.SGD(fusion_model.parameters(),lr=cfg['learning_rate'],momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
-    elif cfg["optimizer"]=="RMSprop":
-        optimizer = torch.optim.RMSprop(fusion_model.parameters(), lr=cfg['learning_rate'], momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
-    else:
-        raise ValueError("Invalid optimizer")
-
-    if cfg["use_scheduler"]=="yes":
-        if cfg['scheduler']=="step":
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg['step_size'], gamma=cfg['gamma'])
-        elif cfg['scheduler']=="reduce":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=cfg['gamma'], patience = cfg['patience'])
-        else:
-            raise ValueError("Invalid scheduler")
-
     best_model = copy.deepcopy(fusion_model)
-    best_dev_loss = np.finfo('float32').max
-    best_dev_accuracy = 0
-    best_dev_balanced_accuracy = 0
-    best_dev_auroc = 0
-    best_dev_f1 = 0
 
-    epoch_no = 0
-
-    for epoch in tqdm(range(cfg['num_epochs'])):
-        noise_variance = 0.0
-        if (cfg["train_random_noise"]=="yes") and (cfg["increase_variance"]=="yes"):
-            noise_variance = cfg["noise_variance"]*(1-math.exp(-epoch_no*cfg["temperature"]))
-            epoch_no +=1
-
-        all_labels = []
-        
-        for idx, batch in enumerate(train_loader):
-            x = [[] for i in range(NUM_MODELS)]
-            (x, y) = batch
-            y = y.to(device)
-            
-            for i in range(NUM_MODELS):
-                x[i] = x[i].to(device)
-                if cfg["train_random_noise"]=="yes":
-                    noise = torch.randn(x[i].shape).to(device)
-                    adjusted_noise = noise*noise_variance
-                    x[i] += adjusted_noise
-
-            all_labels.extend(y.to('cpu').numpy())
-            
-            #forward pass
-            optimizer.zero_grad()
-            final_predictions = fusion_model(x)
-            l = criterion(final_predictions.reshape(-1),y)
-            l.backward()
-            optimizer.step()
-
-            if ENABLE_WANDB:
-                wandb.log({"train_loss": l.to('cpu').item()})
-
-        #eval on dev set
-        dev_metrics = evaluate_fusion_model(fusion_model, dev_loader, cfg)
-        dev_loss = dev_metrics["loss"]
-        dev_accuracy = dev_metrics["accuracy"]
-        dev_balanced_accuracy = dev_metrics["weighted_accuracy"]
-        dev_auroc = dev_metrics["auroc"]
-        dev_f1 = dev_metrics["f1_score"]
-        #print(f"Epoch {epoch}: dev accuracy: {dev_metrics['accuracy']}")
-
-        if cfg['use_scheduler']=="yes":
-            if cfg['scheduler']=='step':
-                scheduler.step()
-            else:
-                scheduler.step(dev_loss)
-
-        if dev_loss<best_dev_loss:
-            best_model = copy.deepcopy(fusion_model)
-
-            best_dev_loss = dev_loss
-            best_dev_accuracy = dev_accuracy
-            best_dev_balanced_accuracy = dev_balanced_accuracy
-            best_dev_auroc = dev_auroc
-            best_dev_f1 = dev_f1
-
-    test_metrics = evaluate_fusion_model(best_model, test_loader, cfg, split="test")
+    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test")
     if ENABLE_WANDB:
         wandb.log(test_metrics)
-        wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1})
+
     print(test_metrics)
 
 if __name__ == "__main__":

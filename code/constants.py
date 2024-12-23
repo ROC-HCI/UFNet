@@ -1,12 +1,14 @@
 import os
 
-BASE_DIR = os.getcwd()+"/../../../"
+BASE_DIR = "/localdisk1/PARK/ufnet_aaai/UFNet"
 
 FINGER_FEATURES_FILE = os.path.join(BASE_DIR,"data/finger_tapping/features_demography_diagnosis_Nov22_2023.csv")
 AUDIO_FEATURES_FILE = os.path.join(BASE_DIR,"data/quick_brown_fox/wavlm_fox_features.csv")
 FACIAL_FEATURES_FILE = os.path.join(BASE_DIR, "data/facial_expression_smile/facial_dataset.csv")
 
 MODEL_BASE_PATH = os.path.join(BASE_DIR,"models")
+MODEL_CONFIG_PATH = os.path.join(MODEL_BASE_PATH, "uncertainty_aware_fusion/model_config.json")
+MODEL_PATH = os.path.join(MODEL_BASE_PATH, "uncertainty_aware_fusion/model.pth")
 
 FACIAL_EXPRESSIONS = {
     'smile': True,

@@ -1,6 +1,6 @@
 import os
 
-BASE_PATH = os.getcwd()+"/../../../"
+BASE_PATH = "/localdisk1/PARK/ufnet_aaai/UFNet/"
 BASE_DIR = BASE_PATH
 
 CLASSICAL_FEATURES_FILE = os.path.join(BASE_PATH,"data/quick_brown_fox/classical_fox_features.csv")

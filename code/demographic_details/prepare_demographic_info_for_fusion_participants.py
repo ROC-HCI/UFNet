@@ -1,3 +1,10 @@
+'''
+Summary:
+The demographic information available is raw and complex.
+Pre-process and reformat the demographic variables and save.
+'''
+
+import torch
 import pandas as pd
 import numpy as np
 from pandas import DataFrame
