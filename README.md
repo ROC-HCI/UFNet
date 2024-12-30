@@ -35,9 +35,11 @@ If you have collected video data of similar tasks from PD patients and healthy i
 * Re-train and evaluate the UFNet model with the new datasets.
 
 **References**
+
 1. Zhou, Andy, et al. "YouTubePD: A Multimodal Benchmark for Parkinson’s Disease Analysis." Advances in Neural Information Processing Systems 36 (2024).
 
 **Cite Our Paper**
+
 If this repository is relevant and helpful for your research, please cite our paper:
 ```
 @article{islam2024accessible,
