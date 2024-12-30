@@ -1,5 +1,5 @@
 '''
-Removed RL with neural layers -- weighted fusion
+Summary: Base UFNet without prediction withholding
 '''
 import os
 import copy
@@ -37,6 +37,8 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet") 
 from constants import *
 
 '''
@@ -467,7 +469,7 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
             linear_layer = nn.Linear(in_features=feature_shapes[i], out_features=self.hidden_dim, bias=True)
             self.intra_linear.append(linear_layer)
 
-        self.lin1 = nn.Linear(in_features=(NUM_MODELS*self.query_dim), out_features=self.last_hidden_dim)
+        self.lin1 = nn.Linear(in_features=((NUM_MODELS*self.query_dim)+NUM_MODELS), out_features=self.last_hidden_dim)
         self.fc = nn.Linear(in_features=self.last_hidden_dim, out_features=1)
         self.softmax = nn.Softmax(dim=-1)
         self.sigmoid = nn.Sigmoid()
@@ -477,7 +479,7 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
         self.lin1_dropout = mcdropout.Dropout(p = self.drop_prob)
     
     def forward(self, inputs):
-        (features, prediction_variances) = inputs
+        (features, predicted_scores, prediction_variances) = inputs
         # print([features[i].shape for i in range(len(features))]) #(n, 232), (n, 1024), (n, 42)
         
         hiddens = []
@@ -488,8 +490,10 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
             hidden_representation = self.layer_norm(hidden_representation)
             hiddens.append(hidden_representation)
 
+        pred_scores = torch.stack(predicted_scores).transpose(0,1) #(n, N)
         context = self.cross_attention(torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS)]), prediction_variances) #(n, d_q)
-        outputs = self.lin1(context) #(n, last_hidden_dim)
+        outputs = torch.cat((context, pred_scores),dim=-1) #(n, N+d_q)
+        outputs = self.lin1(outputs) #(n, last_hidden_dim)
         outputs = self.lin1_dropout(outputs) 
         logits = self.fc(outputs) #(n,1)
         probs = self.sigmoid(logits) #(n,1)
@@ -645,7 +649,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         
         #forward pass
         with torch.no_grad():
-            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_vars), iterations=config["num_trials"])
+            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=config["num_trials"])
             standard_error = (z_critical*final_pred_scores.std(dim=-1).reshape(-1))/math.sqrt(len(final_pred_scores))
             final_pred_scores = final_pred_scores.mean(dim=-1).reshape(-1)
             index_mask = (final_pred_scores-standard_error<=0.50) & (final_pred_scores+standard_error>=0.50)
@@ -709,7 +713,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 
@@ -930,7 +934,7 @@ def main(**cfg):
             
             #forward pass
             optimizer.zero_grad()
-            final_predictions = fusion_model((x, y_vars))
+            final_predictions = fusion_model((x,y_pred_scores, y_vars))
             l = criterion(final_predictions.reshape(-1),y)
             l.backward()
             optimizer.step()

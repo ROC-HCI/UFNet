@@ -1,3 +1,8 @@
+'''
+Summary: Apply conformal prediction with label smoothing.
+
+Withhold predictions using MC dropout.
+'''
 import os
 import copy
 import pickle
@@ -33,7 +38,10 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
+import torch.nn.functional as F
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet") 
 from constants import *
 
 '''
@@ -45,9 +53,9 @@ def get_gpu_memory():
     memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
     return memory_free_values
 
-# results = get_gpu_memory()
-# gpu_id = np.argmax(results)
-# os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+#results = get_gpu_memory()
+#gpu_id = np.argmax(results)
+#os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -61,11 +69,6 @@ with open(os.path.join(BASE_DIR,"data/dev_set_participants.txt")) as f:
 with open(os.path.join(BASE_DIR,"data/test_set_participants.txt")) as f:
     ids = f.readlines()
     test_ids = set([x.strip() for x in ids])
-    
-with open(os.path.join(BASE_DIR,"data/calib_set_participants.txt")) as f:
-    ids = f.readlines()
-    calib_ids = set([x.strip() for x in ids])
-    
 
 	
 print(f"Number of patients in the dev and test set: {len(dev_ids)}, {len(test_ids)}")
@@ -289,14 +292,6 @@ def train_dev_split(train_df, dev_size=0.20):
     return train_df, dev_df
 
 '''
-Calibration Set Separation
-'''
-def train_calibration_split(train_df, dev_size=0.20):
-    calib_df = train_df[train_df["id"].isin(calib_ids)]
-    train_df = train_df[~train_df["id"].isin(calib_ids)]
-    return train_df, calib_df
-
-'''
 Given a dataframe, perform oversampling
 input_df: must contain columns features_0, features_1, ..., features_(N-1), and label
 output_df: oversamples the minority class and returns in similar format
@@ -507,6 +502,20 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
         probs = self.sigmoid(logits) #(n,1)
         return probs
 
+
+'''
+Write a custom loss function to incorporate label smoothing
+'''
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingLoss, self).__init__()
+        self.smoothing = smoothing
+
+    def forward(self, predictions, targets):
+        smoothened_targets = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
+        loss = F.binary_cross_entropy(predictions, smoothened_targets, reduction='mean')
+        return loss
+
 '''
 Evaluate performance on validation/test set.
 Returns all the metrics defined above and the loss.
@@ -614,7 +623,7 @@ def compute_metrics(y_true, y_pred_scores, threshold = 0.5):
 '''
 Main evaluation loop to test the fusion model
 '''
-def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev", conformity_threshold=0.5):
+def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev"):
     fusion_model.eval()
     z_critical = scipy.stats.t.ppf(q=0.975, df = config["num_trials"]-1)
 
@@ -657,8 +666,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         
         #forward pass
         with torch.no_grad():
-            
-            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=1)
+            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=config["num_trials"])
             standard_error = (z_critical*final_pred_scores.std(dim=-1).reshape(-1))/math.sqrt(len(final_pred_scores))
             final_pred_scores = final_pred_scores.mean(dim=-1).reshape(-1)
             index_mask = (final_pred_scores-standard_error<=0.50) & (final_pred_scores+standard_error>=0.50)
@@ -674,62 +682,32 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
     all_labels = np.asarray(all_labels).flatten()
     all_final_predictions = np.asarray(all_final_predictions).flatten()
     
-    # if split=="test":
-    #     coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
-    #     all_labels = all_labels[~uncertain_indices]
-    #     all_final_predictions = all_final_predictions[~uncertain_indices]
-
-    # now for test set, we will apply conformal prediction 
-    
-    
     if split=="test":
-        count_single = 0
-        index_mask_conformal = []
-        all_final_predictions_conformal = []
-        for i in range(len(all_final_predictions)):
-            prediction_set = []
-            if all_final_predictions[i] < 1 - conformity_threshold:
-                prediction_set = [0]
-                count_single += 1
-                index_mask_conformal.append(False)
-            elif all_final_predictions[i] >= conformity_threshold:
-                prediction_set = [1]
-                count_single += 1
-                index_mask_conformal.append(False)
-            else:
-                prediction_set = [0,1]
-                index_mask_conformal.append(True)
-                
-            all_final_predictions_conformal.append(prediction_set)
-            
-        index_mask_conformal = np.asarray(index_mask_conformal).flatten()
-        
-        all_labels = all_labels[~index_mask_conformal]
-        all_final_predictions = all_final_predictions[~index_mask_conformal]
-                 
-        print(f"Number of single predictions: {count_single}")
-        print(f"Number of conformal predictions: {len(all_final_predictions_conformal)}")
-        # print the coverage percentage
-        print(f"Coverage: {round(count_single/len(all_final_predictions_conformal), 2)}")
-        wandb.log({"conformal_coverage": round(count_single/len(all_final_predictions_conformal), 2)}) 
-    
-    
-    
+        coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
+        all_labels = all_labels[~uncertain_indices]
+        all_final_predictions = all_final_predictions[~uncertain_indices]
+
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
-    
-    # if split=="test":
-    #     metrics['coverage'] = coverage
+    if split=="test":
+        metrics['coverage'] = coverage
 
     return metrics
 
-
+'''
+--batch_size=1024 --dropout_prob=0.495989214406461 --gamma=0.57143922410234 --hidden_dim=512 
+--increase_variance=no --last_hidden_dim=128 --learning_rate=0.020724443604128343 
+--minority_oversample=no --model_subset_choice=0 --momentum=0.6897821582954526 
+--num_epochs=164 --optimizer=SGD --patience=5 --query_dim=64 --random_state=357 
+--sampler=SMOTE --scheduler=step --seed=423 --step_size=5 --train_random_noise=no 
+--uncertainty_weight=81.81790352752515 --use_scheduler=no --validation_random_noise=no
+'''
 @click.command()
-@click.option("--learning_rate", default=0.001, help="Learning rate for classifier")
-@click.option("--dropout_prob", default=0.25)
+@click.option("--learning_rate", default=0.020724443604128343, help="Learning rate for classifier")
+@click.option("--dropout_prob", default=0.495989214406461)
 @click.option("--num_buckets", default=20, help="Options: 5, 10, 20, 50, 100")
 @click.option("--num_trials", default=30, help="Options: 100-1000")
-@click.option("--uncertainty_weight", default=0.01)
+@click.option("--uncertainty_weight", default=81.81790352752515)
 @click.option("--minority_oversample",default='no',help="Options: 'yes', 'no'")
 @click.option("--sampler", default='SMOTE', help="Options:SMOTE, SMOTENC, SVMSMOTE, ADASYN, BorderlineSMOTE, KMeansSMOTE, SMOTEN, RandomOverSampler, SMOTEENN, SMOTETomek")
 @click.option("--train_random_noise", default="no", help="Options: yes, no")
@@ -737,30 +715,37 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 @click.option("--increase_variance",default="no", help="Options: yes, no")
 @click.option("--temperature", default=0.05, help="Float between 0 and 1")
 @click.option("--noise_variance",default=0.01,help="Float between 0 and 1")
-@click.option("--random_state", default=171, help="Random state for classifier")
+@click.option("--random_state", default=357, help="Random state for classifier")
 @click.option("--model_subset_choice", default=0, help="4 possible choices. See Constants.py")
-@click.option("--seed", default=113, help="Seed for random")
-@click.option("--batch_size",default=64)
-@click.option("--num_epochs",default=244)
-@click.option("--hidden_dim", default=128)
+@click.option("--seed", default=423, help="Seed for random")
+@click.option("--batch_size",default=1024)
+@click.option("--num_epochs",default=164)
+@click.option("--hidden_dim", default=512)
 @click.option("--query_dim", default=64)
-@click.option("--last_hidden_dim", default=8)
-@click.option("--optimizer",default="AdamW",help="Options: SGD, AdamW, RMSprop")
+@click.option("--last_hidden_dim", default=128)
+@click.option("--optimizer",default="SGD",help="Options: SGD, AdamW, RMSprop")
 @click.option("--beta1",default=0.9)
 @click.option("--beta2",default=0.999)
 @click.option("--weight_decay",default=0.0001)
-@click.option("--momentum",default=0.5317318147195794)
-@click.option("--use_scheduler",default='yes',help="Options: yes, no")
+@click.option("--momentum",default=0.6897821582954526)
+@click.option("--use_scheduler",default='no',help="Options: yes, no")
 @click.option("--scheduler",default='reduce',help="Options: step, reduce")
-@click.option("--step_size",default=21)
-@click.option("--gamma",default=0.34188571201807494)
-@click.option("--patience",default=6)
+@click.option("--step_size",default=5)
+@click.option("--gamma",default=0.57143922410234)
+@click.option("--patience",default=5)
+@click.option("--smoothing_factor",default=0.1)
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
+
+    '''
+    save the configurations obtained from wandb (or command line) into the model config file
+    '''
+    with open(MODEL_CONFIG_PATH,"w") as f:
+        f.write(json.dumps(cfg))
 
     #reproducibility control
     torch.manual_seed(cfg["seed"])
@@ -846,7 +831,6 @@ def main(**cfg):
     
     train_df, test_df = train_test_split(df)
     train_df, dev_df = train_dev_split(train_df)
-    train_df, calib_df = train_calibration_split(train_df)
     
     print(f"Number of training samples: {len(train_df)}. Positive class: {len(train_df[train_df['label']==1.0])}, Negative class: {len(train_df[train_df['label']==0.0])}.")
     print(f"Number of validation samples: {len(dev_df)}. Positive class: {len(dev_df[dev_df['label']==1.0])}, Negative class: {len(dev_df[dev_df['label']==0.0])}.")
@@ -881,12 +865,10 @@ def main(**cfg):
     train_dataset = TensorDataset(train_df)
     dev_dataset = TensorDataset(dev_df)
     test_dataset = TensorDataset(test_df)
-    calib_dataset = TensorDataset(calib_df)
 
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True)
     dev_loader = DataLoader(dev_dataset, batch_size=cfg["batch_size"])
     test_loader = DataLoader(test_dataset, batch_size = cfg['batch_size'])
-    calib_loader = DataLoader(calib_dataset, batch_size = cfg['batch_size'])
 
     features, label = train_dataset[0]
     feature_shapes = [features[i].shape[0] for i in range(NUM_MODELS)]
@@ -919,7 +901,9 @@ def main(**cfg):
     fusion_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
     fusion_model = fusion_model.to(device)
     
-    criterion = nn.BCELoss()
+    #criterion = nn.BCELoss()
+    criterion = LabelSmoothingLoss(smoothing=cfg["smoothing_factor"])
+
     if cfg["optimizer"]=="AdamW":
         optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
     elif cfg["optimizer"]=="SGD":
@@ -1015,54 +999,23 @@ def main(**cfg):
             best_dev_auroc = dev_auroc
             best_dev_f1 = dev_f1
             best_dev_ece = dev_ece
-            
-    # After the training loop ends, use the calibration set to determine conformity scores
 
-    calibration_scores = []
-
-    # Loop through the calibration set to compute conformity scores
-    with torch.no_grad():
-        for batch in calib_loader:
-            x_calib = [[] for i in range(NUM_MODELS)]
-            (x_calib, y_calib) = batch
-            y_calib = y_calib.to(device)
-            y_pred_scores_calib = [[] for i in range(NUM_MODELS)]
-            y_vars_calib = [[] for i in range(NUM_MODELS)]
-            
-            for i in range(NUM_MODELS):
-                x_calib[i] = x_calib[i].to(device)
-                
-                # Get multiple stochastic predictions for calibration
-                y_multi_preds_calib = wrapped_prediction_models[i].predict_on_batch(x_calib[i], iterations=cfg["num_trials"])
-                y_pred_scores_calib[i] = y_multi_preds_calib.mean(dim=-1).reshape(-1)
-                y_vars_calib[i] = y_multi_preds_calib.std(dim=-1).reshape(-1)
-            
-            # Fuse the predictions using the fusion model
-            final_calib_predictions = best_model((x_calib, y_pred_scores_calib, y_vars_calib))
-            
-            # Compute conformity scores based on residuals |y - f(x)|
-            conformity_scores = torch.abs(final_calib_predictions.reshape(-1) - y_calib)
-            calibration_scores.extend(conformity_scores.cpu().numpy())
-
-    # Determine the conformity threshold for 95% confidence
-    alpha = 0.05
-    threshold = np.percentile(calibration_scores, 100 * (1 - alpha))
-
-    # # Save the threshold and best model for inference
-    # torch.save({
-    #     'model_state_dict': best_model.state_dict(),
-    #     'calibration_threshold': threshold
-    # }, 'calibrated_model.pth')
-
-    print(f"Calibration completed. Threshold for 95% confidence: {threshold}")
-
-    
-    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test", conformity_threshold=threshold)
+    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test")
     if ENABLE_WANDB:
-        wandb.log({"conformity_score": threshold})
         wandb.log(test_metrics)
         wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1, "dev_ece":best_dev_ece})
     print(test_metrics)
+
+    # '''
+    # Save best model
+    # '''
+    torch.save(best_model.to('cpu').state_dict(),MODEL_PATH)
+
+    loaded_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
+    loaded_model.load_state_dict(torch.load(MODEL_PATH))
+    loaded_model = loaded_model.to(device)
+    print("="*20)
+    print(evaluate_fusion_model(loaded_model, test_loader, prediction_models, cfg, split="test"))
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,6 @@
+'''
+Summary: this is the attention module we tried before UFNet
+'''
 import os
 import copy
 import pickle
@@ -34,6 +37,8 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet") 
 from constants import *
 
 '''
@@ -390,104 +395,90 @@ Contains two modules:
     2. prediction network
 '''
 class CrossAttention(nn.Module):
-    def __init__(self, input_dim, query_dim, drop_prob, uncertainty_weight):
+    def __init__(self, input_dim, drop_prob):
         super(CrossAttention, self).__init__()
-        self.input_dim = input_dim
-        self.query_dim = query_dim
-        self.drop_prob = drop_prob
-        self.uncertainty_weight = uncertainty_weight
-        
-        self.form_query = torch.nn.Linear(input_dim, query_dim)
-        self.form_key = torch.nn.Linear(input_dim, query_dim)
-        self.form_value = torch.nn.Linear(input_dim, query_dim)
-
-        self.drop = mcdropout.Dropout(p = drop_prob)
+        self.drop1 = mcdropout.Dropout(p = drop_prob)
         self.softmax = nn.Softmax(dim=-1)
+        self.input_dim = input_dim
         self.final_layer = torch.nn.Linear((NUM_MODELS-1) * self.input_dim, self.input_dim)
+        self.drop2 = mcdropout.Dropout(p = drop_prob)
 
-    def forward(self, features, prediction_variances):
-        prediction_variances = torch.stack(prediction_variances).transpose(0,1) #(n, N)
+    def forward(self, q, keys):
+        #print(f"Dimensions: q: {q.shape}, keys: {keys.shape}, key_0: {keys[0].shape}")
+        d = q.shape[1]
+        q = q.unsqueeze(dim=2) #(n, d) -> (n, d, 1)
+
+        score_q_ks = []
+        for i in range(NUM_MODELS-1):
+            score_q_k = torch.matmul(q, keys[i].unsqueeze(dim=2).transpose(-1,-2)) #(n, d, 1)*(n, 1, d) = (n, d, d)
+            score_q_k = score_q_k/math.sqrt(d) #(n,d,d)
+            score_q_ks.append(score_q_k) #-->(N,n,d,d)
+    
+        all_scores = torch.stack(score_q_ks) #(NUM_MODELS-1, n, d, d)
+        all_scores = self.drop1(all_scores) #apply random dropout
+        weight = self.softmax(all_scores) #(NUM_MODELS-1, n, d, d)
         
-        queries = []
-        keys = []
-        values = []
-        for i in range(NUM_MODELS):
-            q = self.form_query(features[i])
-            q = self.drop(q)
-
-            key = self.form_key(features[i])
-            key = self.drop(q)
-
-            val = self.form_value(features[i])
-            val = self.drop(val)
-
-            queries.append(q)
-            keys.append(key)
-            values.append(val)
-
-        queries = torch.stack(queries) #(N, n, d)
-        queries = queries.transpose(0,1) #(n, N, d)
-        keys = torch.stack(keys) #(N, n, d)
-        keys_T = keys.transpose(0,1).transpose(-1,-2) #(n, d, N)
-        values = torch.stack(values) #(N, n, d)
-        values = values.transpose(0,1) #(n, N, d)
-
-        scores = torch.matmul(queries, keys_T) #(n, N, N)
-        #scores = self.softmax(scores) #the mid dimension sums up to 1, e.g., rows of scores[0]
-
-        vars = prediction_variances.repeat(1, NUM_MODELS).reshape(-1, NUM_MODELS, NUM_MODELS) #(n, N, N)
-        vars = vars + prediction_variances.unsqueeze(dim=-1) #(n, N, N)
-        scores = scores - self.uncertainty_weight*vars #(n, N, N)
-        scores = self.softmax(scores)
-        
-        zs = torch.matmul(scores, values) #(n, N, d)
-        z = zs.reshape((-1, NUM_MODELS*self.query_dim)) #(n, N*d)
-        return z
-
-class HybridFusionNetworkWithUncertainty(nn.Module):
+        #k1: (n, d) => torch.stack([k1, k2, ...]): (NUM_MODELS, n, d) => unsqueeze(dim=3): (NUM_MODELS, n, d, 1)
+        #(N,n,d,d)*(N,n,d,1) = (N,n,d,1) => squeeze(dim=-1): (N,n,d)
+        outputs = torch.matmul(weight, keys.unsqueeze(dim=3)).squeeze(dim=-1)
+        outputs = outputs.transpose(0,1) #(n,N,d)
+        outputs = outputs.reshape((-1, (NUM_MODELS-1)*self.input_dim)) #(n, N*d)
+        outputs = self.final_layer(outputs) #(n,d)
+        outputs = self.drop2(outputs)
+        outputs = q.squeeze(dim=-1) + outputs #(n, d)
+        return outputs
+    
+class HybridFusionNetwork(nn.Module):
     def __init__(self, feature_shapes, config):
-        super(HybridFusionNetworkWithUncertainty, self).__init__()
-        self.hidden_dim = config["hidden_dim"]
-        self.query_dim = config["query_dim"]
-        self.last_hidden_dim = config["last_hidden_dim"]
+        super(HybridFusionNetwork, self).__init__()
         self.drop_prob = config["dropout_prob"]
-        self.uncertainty_weight = config["uncertainty_weight"]
+        self.hidden_dim = config["hidden_dim"]
+        self.last_hidden_dim = config["last_hidden_dim"]
         '''
         input: features_i is of shape (feature_shapes[i]); y_pred_score_i
         total input size: feature_shapes[i]+1
         '''
         self.intra_linear = nn.ModuleList()
+        self.intra_linear_dropout = mcdropout.Dropout(p = self.drop_prob)
         self.layer_norm = nn.LayerNorm(self.hidden_dim)
-        self.cross_attention = CrossAttention(self.hidden_dim, self.query_dim, self.drop_prob, self.uncertainty_weight) #shared weights
+        self.cross_attention = CrossAttention(self.hidden_dim, self.drop_prob) #shared weights
 
         for i in range(NUM_MODELS):
             linear_layer = nn.Linear(in_features=feature_shapes[i], out_features=self.hidden_dim, bias=True)
             self.intra_linear.append(linear_layer)
 
-        self.lin1 = nn.Linear(in_features=((NUM_MODELS*self.query_dim)+NUM_MODELS), out_features=self.last_hidden_dim)
+        self.lin1 = nn.Linear(in_features=NUM_MODELS*(self.hidden_dim+1), out_features=self.last_hidden_dim)
+        self.lin1_dropout = mcdropout.Dropout(p = self.drop_prob)
         self.fc = nn.Linear(in_features=self.last_hidden_dim, out_features=1)
         self.softmax = nn.Softmax(dim=-1)
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
-
-        self.intra_linear_dropout = mcdropout.Dropout(p = self.drop_prob)
-        self.lin1_dropout = mcdropout.Dropout(p = self.drop_prob)
     
     def forward(self, inputs):
-        (features, predicted_scores, prediction_variances) = inputs
-        # print([features[i].shape for i in range(len(features))]) #(n, 232), (n, 1024), (n, 42)
-        
+        (features, predicted_scores) = inputs
         hiddens = []
         for i in range(NUM_MODELS):
-            hidden_representation = self.relu(self.intra_linear[i](features[i])) #projection: (n, d_{x_i}) -> (n,d)
+            predicted_scores[i] = predicted_scores[i].reshape(-1,1) #(n,1)
+            hidden_representation = self.intra_linear[i](features[i]) #projection: (n, d_{x_i}) -> (n,d)
             hidden_representation = self.intra_linear_dropout(hidden_representation)
-            hidden_representation = self.relu(hidden_representation)
+            hidden_representation = self.relu(hidden_representation) 
             hidden_representation = self.layer_norm(hidden_representation)
             hiddens.append(hidden_representation)
 
-        pred_scores = torch.stack(predicted_scores).transpose(0,1) #(n, N)
-        context = self.cross_attention(torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS)]), prediction_variances) #(n, d_q)
-        outputs = torch.cat((context, pred_scores),dim=-1) #(n, N+d_q)
+        #print(f"Hidden shapes: {[hiddens[i].shape for i in range(NUM_MODELS)]}")
+        
+        contexts = []
+        for i in range(NUM_MODELS):
+            #print(f"Shapes passed to x-attention: {hiddens[i].shape}, {torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS) if k!=i]).shape}")
+            context = self.cross_attention(hiddens[i], torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS) if k!=i])) #(n,d)
+            context = self.layer_norm(context)
+            #print(context.shape)
+            contexts.append(context)
+
+        #(n, NUM_MODELS*d)
+        attention_vecs = torch.cat((contexts),dim=-1)
+        pred_scores = torch.cat((predicted_scores),dim=-1)
+        outputs = torch.cat((attention_vecs, pred_scores),dim=-1)
         outputs = self.lin1(outputs) #(n, last_hidden_dim)
         outputs = self.lin1_dropout(outputs) 
         logits = self.fc(outputs) #(n,1)
@@ -644,7 +635,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         
         #forward pass
         with torch.no_grad():
-            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=config["num_trials"])
+            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores), iterations=config["num_trials"])
             standard_error = (z_critical*final_pred_scores.std(dim=-1).reshape(-1))/math.sqrt(len(final_pred_scores))
             final_pred_scores = final_pred_scores.mean(dim=-1).reshape(-1)
             index_mask = (final_pred_scores-standard_error<=0.50) & (final_pred_scores+standard_error>=0.50)
@@ -660,16 +651,15 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
     all_labels = np.asarray(all_labels).flatten()
     all_final_predictions = np.asarray(all_final_predictions).flatten()
     
-    # if split=="test":
-    #     coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
-    #     all_labels = all_labels[~uncertain_indices]
-    #     all_final_predictions = all_final_predictions[~uncertain_indices]
+    if split=="test":
+        coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
+        all_labels = all_labels[~uncertain_indices]
+        all_final_predictions = all_final_predictions[~uncertain_indices]
 
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
-    
-    # if split=="test":
-    #     metrics['coverage'] = coverage
+    if split=="test":
+        metrics['coverage'] = coverage
 
     return metrics
 
@@ -708,7 +698,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 
@@ -863,7 +853,7 @@ def main(**cfg):
 
     print("All the prediction models are loaded as frozen.")
 
-    fusion_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
+    fusion_model = HybridFusionNetwork(feature_shapes, cfg)
     fusion_model = fusion_model.to(device)
     
     criterion = nn.BCELoss()
@@ -929,7 +919,7 @@ def main(**cfg):
             
             #forward pass
             optimizer.zero_grad()
-            final_predictions = fusion_model((x,y_pred_scores, y_vars))
+            final_predictions = fusion_model((x,y_pred_scores))
             l = criterion(final_predictions.reshape(-1),y)
             l.backward()
             optimizer.step()

@@ -1,5 +1,9 @@
 '''
-Removed RL with neural layers -- weighted fusion
+Summary: Apply conformal prediction with platt scaling 
+on top of UFNet.
+
+Find a threshold and determine the cases where 
+the prediction set size is one (withhold others).
 '''
 import os
 import copy
@@ -36,7 +40,11 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
+from sklearn.linear_model import LogisticRegression
+import torch.nn.functional as F
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet") 
 from constants import *
 
 '''
@@ -48,9 +56,9 @@ def get_gpu_memory():
     memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
     return memory_free_values
 
-results = get_gpu_memory()
-gpu_id = np.argmax(results)
-os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+# results = get_gpu_memory()
+# gpu_id = np.argmax(results)
+# os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -64,6 +72,11 @@ with open(os.path.join(BASE_DIR,"data/dev_set_participants.txt")) as f:
 with open(os.path.join(BASE_DIR,"data/test_set_participants.txt")) as f:
     ids = f.readlines()
     test_ids = set([x.strip() for x in ids])
+    
+with open(os.path.join(BASE_DIR,"data/calib_set_participants.txt")) as f:
+    ids = f.readlines()
+    calib_ids = set([x.strip() for x in ids])
+    
 
 	
 print(f"Number of patients in the dev and test set: {len(dev_ids)}, {len(test_ids)}")
@@ -287,6 +300,14 @@ def train_dev_split(train_df, dev_size=0.20):
     return train_df, dev_df
 
 '''
+Calibration Set Separation
+'''
+def train_calibration_split(train_df, dev_size=0.20):
+    calib_df = train_df[train_df["id"].isin(calib_ids)]
+    train_df = train_df[~train_df["id"].isin(calib_ids)]
+    return train_df, calib_df
+
+'''
 Given a dataframe, perform oversampling
 input_df: must contain columns features_0, features_1, ..., features_(N-1), and label
 output_df: oversamples the minority class and returns in similar format
@@ -467,7 +488,7 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
             linear_layer = nn.Linear(in_features=feature_shapes[i], out_features=self.hidden_dim, bias=True)
             self.intra_linear.append(linear_layer)
 
-        self.lin1 = nn.Linear(in_features=(NUM_MODELS*self.query_dim), out_features=self.last_hidden_dim)
+        self.lin1 = nn.Linear(in_features=((NUM_MODELS*self.query_dim)+NUM_MODELS), out_features=self.last_hidden_dim)
         self.fc = nn.Linear(in_features=self.last_hidden_dim, out_features=1)
         self.softmax = nn.Softmax(dim=-1)
         self.sigmoid = nn.Sigmoid()
@@ -477,7 +498,7 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
         self.lin1_dropout = mcdropout.Dropout(p = self.drop_prob)
     
     def forward(self, inputs):
-        (features, prediction_variances) = inputs
+        (features, predicted_scores, prediction_variances) = inputs
         # print([features[i].shape for i in range(len(features))]) #(n, 232), (n, 1024), (n, 42)
         
         hiddens = []
@@ -488,8 +509,10 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
             hidden_representation = self.layer_norm(hidden_representation)
             hiddens.append(hidden_representation)
 
+        pred_scores = torch.stack(predicted_scores).transpose(0,1) #(n, N)
         context = self.cross_attention(torch.cat([torch.unsqueeze(hiddens[k],0) for k in range(NUM_MODELS)]), prediction_variances) #(n, d_q)
-        outputs = self.lin1(context) #(n, last_hidden_dim)
+        outputs = torch.cat((context, pred_scores),dim=-1) #(n, N+d_q)
+        outputs = self.lin1(outputs) #(n, last_hidden_dim)
         outputs = self.lin1_dropout(outputs) 
         logits = self.fc(outputs) #(n,1)
         probs = self.sigmoid(logits) #(n,1)
@@ -599,10 +622,29 @@ def compute_metrics(y_true, y_pred_scores, threshold = 0.5):
     
     return metrics
 
+def fit_platt_scaling(calibration_logits, calibration_labels):
+    """
+    Fits a logistic regression model for Platt scaling.
+    """
+    platt_model = LogisticRegression()
+    calibration_logits = calibration_logits.reshape(-1, 1)
+    platt_model.fit(calibration_logits, calibration_labels)
+    return platt_model
+
+def apply_platt_scaling(platt_model, logits):
+    """
+    Applies Platt scaling to logits.
+    """
+    logits = logits.reshape(-1, 1)
+    calibrated_probs = platt_model.predict_proba(logits)[:, 1]  # Get probability of class 1
+    return calibrated_probs
+
+
+
 '''
 Main evaluation loop to test the fusion model
 '''
-def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev"):
+def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev", conformity_threshold=0.5, platt_model=None):
     fusion_model.eval()
     z_critical = scipy.stats.t.ppf(q=0.975, df = config["num_trials"]-1)
 
@@ -645,7 +687,8 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         
         #forward pass
         with torch.no_grad():
-            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_vars), iterations=config["num_trials"])
+            
+            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=1)
             standard_error = (z_critical*final_pred_scores.std(dim=-1).reshape(-1))/math.sqrt(len(final_pred_scores))
             final_pred_scores = final_pred_scores.mean(dim=-1).reshape(-1)
             index_mask = (final_pred_scores-standard_error<=0.50) & (final_pred_scores+standard_error>=0.50)
@@ -653,6 +696,12 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
             loss += criterion(final_pred_scores.reshape(-1), y)*n
             n_samples+=n
         
+        if split == "test" and platt_model is not None:
+            #print("Before Platt Scaling")
+            #print(final_pred_scores)
+            final_pred_scores = torch.tensor(apply_platt_scaling(platt_model, final_pred_scores.cpu().numpy())).to(device)
+            #print("After Platt Scaling")
+            #print(final_pred_scores)
         all_final_predictions.extend(final_pred_scores.cpu().numpy())
         uncertain_indices.extend(index_mask.cpu().numpy())
 
@@ -661,15 +710,55 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
     all_labels = np.asarray(all_labels).flatten()
     all_final_predictions = np.asarray(all_final_predictions).flatten()
     
-    if split=="test":
-        coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
-        all_labels = all_labels[~uncertain_indices]
-        all_final_predictions = all_final_predictions[~uncertain_indices]
+    # if split=="test":
+    #     coverage = (len(all_labels) - uncertain_indices.sum())/len(all_labels)
+    #     all_labels = all_labels[~uncertain_indices]
+    #     all_final_predictions = all_final_predictions[~uncertain_indices]
 
+    # now for test set, we will apply conformal prediction 
+    
+    # print(all_final_predictions)
+    
+    if split=="test":
+        count_single = 0
+        index_mask_conformal = []
+        all_final_predictions_conformal = []
+        for i in range(len(all_final_predictions)):
+            prediction_set = []
+            if all_final_predictions[i] < 1 - conformity_threshold:
+                prediction_set = [0]
+                count_single += 1
+                index_mask_conformal.append(False)
+            elif all_final_predictions[i] >= conformity_threshold:
+                prediction_set = [1]
+                count_single += 1
+                index_mask_conformal.append(False)
+            else:
+                prediction_set = [0,1]
+                index_mask_conformal.append(True)
+                
+            all_final_predictions_conformal.append(prediction_set)
+            
+        index_mask_conformal = np.asarray(index_mask_conformal).flatten()
+        
+        all_labels = all_labels[~index_mask_conformal]
+        all_final_predictions = all_final_predictions[~index_mask_conformal]
+                 
+        print(f"Number of single predictions: {count_single}")
+        print(f"Number of conformal predictions: {len(all_final_predictions_conformal)}")
+        # print the coverage percentage
+        print(f"Coverage: {round(count_single/len(all_final_predictions_conformal), 2)}")
+        # wandb.log({"conformal_coverage": round(count_single/len(all_final_predictions_conformal), 2)})
+        
+         
+    
+    
+    
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
-    if split=="test":
-        metrics['coverage'] = coverage
+    
+    # if split=="test":
+    #     metrics['coverage'] = coverage
 
     return metrics
 
@@ -708,7 +797,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 
@@ -796,6 +885,7 @@ def main(**cfg):
     
     train_df, test_df = train_test_split(df)
     train_df, dev_df = train_dev_split(train_df)
+    train_df, calib_df = train_calibration_split(train_df)
     
     print(f"Number of training samples: {len(train_df)}. Positive class: {len(train_df[train_df['label']==1.0])}, Negative class: {len(train_df[train_df['label']==0.0])}.")
     print(f"Number of validation samples: {len(dev_df)}. Positive class: {len(dev_df[dev_df['label']==1.0])}, Negative class: {len(dev_df[dev_df['label']==0.0])}.")
@@ -830,10 +920,12 @@ def main(**cfg):
     train_dataset = TensorDataset(train_df)
     dev_dataset = TensorDataset(dev_df)
     test_dataset = TensorDataset(test_df)
+    calib_dataset = TensorDataset(calib_df)
 
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True)
     dev_loader = DataLoader(dev_dataset, batch_size=cfg["batch_size"])
     test_loader = DataLoader(test_dataset, batch_size = cfg['batch_size'])
+    calib_loader = DataLoader(calib_dataset, batch_size = cfg['batch_size'])
 
     features, label = train_dataset[0]
     feature_shapes = [features[i].shape[0] for i in range(NUM_MODELS)]
@@ -929,7 +1021,7 @@ def main(**cfg):
             
             #forward pass
             optimizer.zero_grad()
-            final_predictions = fusion_model((x, y_vars))
+            final_predictions = fusion_model((x,y_pred_scores, y_vars))
             l = criterion(final_predictions.reshape(-1),y)
             l.backward()
             optimizer.step()
@@ -962,8 +1054,81 @@ def main(**cfg):
             best_dev_auroc = dev_auroc
             best_dev_f1 = dev_f1
             best_dev_ece = dev_ece
+    
+    # After training, collect logits and labels from calibration set
+    logits, labels = [], []
 
-    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test")
+    fusion_model.eval()
+    with torch.no_grad():
+        for batch in calib_loader:
+            x = [[] for i in range(NUM_MODELS)]
+            (x, y) = batch
+            y = y.to(device)
+            y_pred_scores = [[] for i in range(NUM_MODELS)]
+            y_vars = [[] for i in range(NUM_MODELS)]
+
+            for i in range(NUM_MODELS):
+                x[i] = x[i].to(device)
+                y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=cfg["num_trials"])
+                y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
+                y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
+
+            final_predictions = fusion_model((x, y_pred_scores, y_vars))
+            logits.extend(final_predictions.reshape(-1).cpu().numpy())
+            labels.extend(y.reshape(-1).cpu().numpy())
+
+    # Fit Platt scaling model
+    platt_model = fit_platt_scaling(np.array(logits), np.array(labels))
+
+    # After the training loop ends, use the calibration set to determine conformity scores
+
+    calibration_scores = []
+
+    # Loop through the calibration set to compute conformity scores
+    with torch.no_grad():
+        for batch in calib_loader:
+            x_calib = [[] for i in range(NUM_MODELS)]
+            (x_calib, y_calib) = batch
+            y_calib = y_calib.to(device)
+            y_pred_scores_calib = [[] for i in range(NUM_MODELS)]
+            y_vars_calib = [[] for i in range(NUM_MODELS)]
+            
+            for i in range(NUM_MODELS):
+                x_calib[i] = x_calib[i].to(device)
+                
+                # Get multiple stochastic predictions for calibration
+                y_multi_preds_calib = wrapped_prediction_models[i].predict_on_batch(x_calib[i], iterations=cfg["num_trials"])
+                y_pred_scores_calib[i] = y_multi_preds_calib.mean(dim=-1).reshape(-1)
+                y_vars_calib[i] = y_multi_preds_calib.std(dim=-1).reshape(-1)
+            
+            # Fuse the predictions using the fusion model
+            final_calib_predictions = best_model((x_calib, y_pred_scores_calib, y_vars_calib))
+            
+            # get the calibrated probabilities
+            #print("Before Platt Scaling")
+            #print(final_calib_predictions)
+            final_calib_predictions = torch.tensor(apply_platt_scaling(platt_model, final_calib_predictions.cpu().numpy())).to(device)
+            #print("After Platt Scaling")
+            #print(final_calib_predictions)
+            
+            # Compute conformity scores based on residuals |y - f(x)|
+            conformity_scores = torch.abs(final_calib_predictions.reshape(-1) - y_calib)
+            calibration_scores.extend(conformity_scores.cpu().numpy())
+
+    # Determine the conformity threshold for 95% confidence
+    alpha = 0.05
+    threshold = np.percentile(calibration_scores, 100 * (1 - alpha))
+
+    # # Save the threshold and best model for inference
+    # torch.save({
+    #     'model_state_dict': best_model.state_dict(),
+    #     'calibration_threshold': threshold
+    # }, 'calibrated_model.pth')
+
+    print(f"Calibration completed. Threshold for 95% confidence: {threshold}")
+
+
+    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test", conformity_threshold=threshold, platt_model=platt_model)
     if ENABLE_WANDB:
         wandb.log(test_metrics)
         wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1, "dev_ece":best_dev_ece})

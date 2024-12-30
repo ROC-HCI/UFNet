@@ -9,6 +9,8 @@ import random
 import click
 import imblearn
 import scipy
+from sklearn.model_selection import KFold
+
 
 import pandas as pd
 import numpy as np
@@ -33,9 +35,9 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
-from sklearn.linear_model import LogisticRegression
-import torch.nn.functional as F
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet") 
 from constants import *
 
 '''
@@ -56,18 +58,13 @@ if torch.cuda.is_available():
     device = 'cuda'
 
 #1. Load dev and test sets (participant ids)
-with open(os.path.join(BASE_DIR,"data/dev_set_participants.txt")) as f:
+with open(os.path.join(BASE_DIR,"data/dev_set_participants_yt_pd.txt")) as f:
     ids = f.readlines()
     dev_ids = set([x.strip() for x in ids])
 
-with open(os.path.join(BASE_DIR,"data/test_set_participants.txt")) as f:
+with open(os.path.join(BASE_DIR,"data/test_set_participants_yt_pd.txt")) as f:
     ids = f.readlines()
     test_ids = set([x.strip() for x in ids])
-    
-with open(os.path.join(BASE_DIR,"data/calib_set_participants.txt")) as f:
-    ids = f.readlines()
-    calib_ids = set([x.strip() for x in ids])
-    
 
 	
 print(f"Number of patients in the dev and test set: {len(dev_ids)}, {len(test_ids)}")
@@ -86,12 +83,14 @@ def parse_date(name:str):
     date = match.group()
     return date
 
+YOUTUBEPD_FEATURE_FILE_SMILE = os.path.join(BASE_DIR,"data/facial_expression_smile/youtube_PD_features_updated.csv")
+
 def load_smile_data(drop_correlated = True, corr_thr = 0.85):
-    df = pd.read_csv(FACIAL_FEATURES_FILE)
+    df = pd.read_csv(YOUTUBEPD_FEATURE_FILE_SMILE)
 
     #Fill data point by 0 if it is null
     df.fillna(0, inplace=True)
-    
+        
     '''
     Get the expression relavant feature columns and the feature dataframe
     '''
@@ -101,7 +100,9 @@ def load_smile_data(drop_correlated = True, corr_thr = 0.85):
             if FACIAL_EXPRESSIONS[expression] and expression in feature.lower():
                 feature_columns.append(feature)
                 break
+            
     df_features = df[feature_columns]
+    
 
     '''
     Drop columns (if set true) if it is correlated with another one with PCC>thr
@@ -129,17 +130,19 @@ def load_smile_data(drop_correlated = True, corr_thr = 0.85):
     # end of drop correlated columns implementation
     
     features = df.loc[:, df_features.columns[0]:df_features.columns[-1]]
-    columns = df_features.columns
     features = features.to_numpy()
+    columns = df_features.columns
 
     df["id"] = df['ID']
-    df["date"] = df.Filename.apply(parse_date)
+    df["id"] = df["id"].astype(str)
     df["id_date"] = df["id"]+"#"+df["date"]
-    df["label"] = 1.0*(df["pd"]!="no")
+    df["label"] = 1.0*(df["pd"]!="n")
 
     return features, df["label"], df["id"], columns, df["id_date"]
 
-def load_qbf_data(drop_correlated = False, corr_thr = 0.85, feature_files=[AUDIO_FEATURES_FILE]):
+YOUTUBEPD_FEATURE_FILE_SPEECH = os.path.join(BASE_DIR,"data/quick_brown_fox/YoutubePD_WavLM.csv")
+
+def load_qbf_data(drop_correlated = False, corr_thr = 0.85):
     def parse_patient_id(name:str):
         if name.startswith("NIH"): [ID, *_] = name.split("-")
         elif name.endswith("-quick_brown_fox.mp4"): [*_, ID, _] = name.split("-")
@@ -147,28 +150,9 @@ def load_qbf_data(drop_correlated = False, corr_thr = 0.85, feature_files=[AUDIO
         else: [*_, ID, _, _, _] = name.split("_")
         return ID
     
-    dataframes = []
-    for FEATURES_FILE in feature_files:
-        df_temp = pd.read_csv(FEATURES_FILE)
-        dataframes.append(df_temp)
+    df = pd.read_csv(YOUTUBEPD_FEATURE_FILE_SPEECH)
+    df_features = df.drop(columns=['fileID', 'id', 'pd'])
 
-    assert (len(dataframes)>=1) and (len(dataframes)<=2)
-    df = dataframes[0]
-    #print(df.columns[:20]) #'Filename', 'Participant_ID', 'gender', 'age', 'race', 'pd', f'wavlm_feature{x}'
-    for i in range(1,len(feature_files)):
-        df = pd.merge(left=df, right=dataframes[i], how='inner', on='Filename')
-
-    if len(dataframes)==2:
-        df = df.drop(columns=['Participant_ID_y', 'gender_y', 'age_y', 'race_y', 'pd_y'])
-        df = df.rename(columns={'Participant_ID_x':'Participant_ID', 'gender_x':'gender', 'age_x':'age', 'race_x':'race', 'pd_x':'pd'})
-
-    '''
-    Drop data point if any of the feature is null
-    '''
-    df = df.dropna(subset = df.columns.difference(['Filename','Participant_ID', 'gender','age','race']), how='any')
- 
-    #Drop metadata columns to focus on features
-    df_features = df.drop(columns=['Filename','Participant_ID', 'gender','age','race','pd'])
  
     '''
     Drop columns (if set true) if it is correlated with another one with PCC>thr
@@ -199,10 +183,10 @@ def load_qbf_data(drop_correlated = False, corr_thr = 0.85, feature_files=[AUDIO
     columns = features.columns
     features = features.to_numpy()
     
-    df["id"] = df.Filename.apply(parse_patient_id)
-    df["date"] = df.Filename.apply(parse_date)
+    df["date"] = '1/1/24'
+    df["id"] = df["id"].astype(str)
     df["id_date"] = df["id"]+"#"+df["date"]
-    df["label"] = df["pd"]
+    df["label"] = 1.0*(df["pd"]!='n')
     return features, df["label"], df["id"], columns, df["id_date"]
 
 def load_finger_data(hand="left",drop_correlated = False, corr_thr = 0.85):
@@ -289,14 +273,6 @@ def train_dev_split(train_df, dev_size=0.20):
     dev_df = train_df[train_df["id"].isin(dev_ids)]
     train_df = train_df[~train_df["id"].isin(dev_ids)]
     return train_df, dev_df
-
-'''
-Calibration Set Separation
-'''
-def train_calibration_split(train_df, dev_size=0.20):
-    calib_df = train_df[train_df["id"].isin(calib_ids)]
-    train_df = train_df[~train_df["id"].isin(calib_ids)]
-    return train_df, calib_df
 
 '''
 Given a dataframe, perform oversampling
@@ -613,29 +589,10 @@ def compute_metrics(y_true, y_pred_scores, threshold = 0.5):
     
     return metrics
 
-def fit_platt_scaling(calibration_logits, calibration_labels):
-    """
-    Fits a logistic regression model for Platt scaling.
-    """
-    platt_model = LogisticRegression()
-    calibration_logits = calibration_logits.reshape(-1, 1)
-    platt_model.fit(calibration_logits, calibration_labels)
-    return platt_model
-
-def apply_platt_scaling(platt_model, logits):
-    """
-    Applies Platt scaling to logits.
-    """
-    logits = logits.reshape(-1, 1)
-    calibrated_probs = platt_model.predict_proba(logits)[:, 1]  # Get probability of class 1
-    return calibrated_probs
-
-
-
 '''
 Main evaluation loop to test the fusion model
 '''
-def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev", conformity_threshold=0.5, platt_model=None):
+def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev"):
     fusion_model.eval()
     z_critical = scipy.stats.t.ppf(q=0.975, df = config["num_trials"]-1)
 
@@ -678,8 +635,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         
         #forward pass
         with torch.no_grad():
-            
-            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=1)
+            final_pred_scores = wrapped_fusion_model.predict_on_batch((x, y_pred_scores, y_vars), iterations=config["num_trials"])
             standard_error = (z_critical*final_pred_scores.std(dim=-1).reshape(-1))/math.sqrt(len(final_pred_scores))
             final_pred_scores = final_pred_scores.mean(dim=-1).reshape(-1)
             index_mask = (final_pred_scores-standard_error<=0.50) & (final_pred_scores+standard_error>=0.50)
@@ -687,12 +643,6 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
             loss += criterion(final_pred_scores.reshape(-1), y)*n
             n_samples+=n
         
-        if split == "test" and platt_model is not None:
-            #print("Before Platt Scaling")
-            #print(final_pred_scores)
-            final_pred_scores = torch.tensor(apply_platt_scaling(platt_model, final_pred_scores.cpu().numpy())).to(device)
-            #print("After Platt Scaling")
-            #print(final_pred_scores)
         all_final_predictions.extend(final_pred_scores.cpu().numpy())
         uncertain_indices.extend(index_mask.cpu().numpy())
 
@@ -706,45 +656,6 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
     #     all_labels = all_labels[~uncertain_indices]
     #     all_final_predictions = all_final_predictions[~uncertain_indices]
 
-    # now for test set, we will apply conformal prediction 
-    
-    # print(all_final_predictions)
-    
-    if split=="test":
-        count_single = 0
-        index_mask_conformal = []
-        all_final_predictions_conformal = []
-        for i in range(len(all_final_predictions)):
-            prediction_set = []
-            if all_final_predictions[i] < 1 - conformity_threshold:
-                prediction_set = [0]
-                count_single += 1
-                index_mask_conformal.append(False)
-            elif all_final_predictions[i] >= conformity_threshold:
-                prediction_set = [1]
-                count_single += 1
-                index_mask_conformal.append(False)
-            else:
-                prediction_set = [0,1]
-                index_mask_conformal.append(True)
-                
-            all_final_predictions_conformal.append(prediction_set)
-            
-        index_mask_conformal = np.asarray(index_mask_conformal).flatten()
-        
-        all_labels = all_labels[~index_mask_conformal]
-        all_final_predictions = all_final_predictions[~index_mask_conformal]
-                 
-        print(f"Number of single predictions: {count_single}")
-        print(f"Number of conformal predictions: {len(all_final_predictions_conformal)}")
-        # print the coverage percentage
-        print(f"Coverage: {round(count_single/len(all_final_predictions_conformal), 2)}")
-        # wandb.log({"conformal_coverage": round(count_single/len(all_final_predictions_conformal), 2)})
-        
-         
-    
-    
-    
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
     
@@ -768,7 +679,7 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 @click.option("--temperature", default=0.05, help="Float between 0 and 1")
 @click.option("--noise_variance",default=0.01,help="Float between 0 and 1")
 @click.option("--random_state", default=171, help="Random state for classifier")
-@click.option("--model_subset_choice", default=0, help="4 possible choices. See Constants.py")
+@click.option("--model_subset_choice", default=3, help="4 possible choices. See Constants.py")
 @click.option("--seed", default=113, help="Seed for random")
 @click.option("--batch_size",default=64)
 @click.option("--num_epochs",default=244)
@@ -784,11 +695,12 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 @click.option("--scheduler",default='reduce',help="Options: step, reduce")
 @click.option("--step_size",default=21)
 @click.option("--gamma",default=0.34188571201807494)
+@click.option("--fold",default=4)
 @click.option("--patience",default=6)
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 
@@ -862,6 +774,7 @@ def main(**cfg):
             features = scaler.transform(features)
 
         all_data = pd.DataFrame.from_dict({f"features_{i}":(list)(features), f"label_{i}":labels, f"id_{i}":ids, "row_id":row_ids})
+        print("Size of the dataset: ", len(all_data))
         processed_datasets.append(all_data)
 
         if i>0:
@@ -869,14 +782,17 @@ def main(**cfg):
             all_data = all_data.drop(columns=[f'label_{i}', f'id_{i}'])
             processed_datasets[i] = all_data
 
+    
+    
     df = processed_datasets[NUM_MODELS-1]
     df = df.rename(columns={"label_0":"label", "id_0":"id"})
     
     print("Data of finger tapping, audio, and smile is combined and loaded.")
     
+    print(f"Number of samples: {len(df)}. Positive class: {len(df[df['label']==1.0])}, Negative class: {len(df[df['label']==0.0])}.")
+
     train_df, test_df = train_test_split(df)
     train_df, dev_df = train_dev_split(train_df)
-    train_df, calib_df = train_calibration_split(train_df)
     
     print(f"Number of training samples: {len(train_df)}. Positive class: {len(train_df[train_df['label']==1.0])}, Negative class: {len(train_df[train_df['label']==0.0])}.")
     print(f"Number of validation samples: {len(dev_df)}. Positive class: {len(dev_df[dev_df['label']==1.0])}, Negative class: {len(dev_df[dev_df['label']==0.0])}.")
@@ -911,12 +827,10 @@ def main(**cfg):
     train_dataset = TensorDataset(train_df)
     dev_dataset = TensorDataset(dev_df)
     test_dataset = TensorDataset(test_df)
-    calib_dataset = TensorDataset(calib_df)
 
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True)
-    dev_loader = DataLoader(dev_dataset, batch_size=cfg["batch_size"])
+    dev_loader = DataLoader(test_dataset, batch_size=cfg["batch_size"])
     test_loader = DataLoader(test_dataset, batch_size = cfg['batch_size'])
-    calib_loader = DataLoader(calib_dataset, batch_size = cfg['batch_size'])
 
     features, label = train_dataset[0]
     feature_shapes = [features[i].shape[0] for i in range(NUM_MODELS)]
@@ -950,176 +864,121 @@ def main(**cfg):
     fusion_model = fusion_model.to(device)
     
     criterion = nn.BCELoss()
-    if cfg["optimizer"]=="AdamW":
-        optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
-    elif cfg["optimizer"]=="SGD":
-        optimizer = torch.optim.SGD(fusion_model.parameters(),lr=cfg['learning_rate'],momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
-    elif cfg["optimizer"]=="RMSprop":
-        optimizer = torch.optim.RMSprop(fusion_model.parameters(), lr=cfg['learning_rate'], momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
-    else:
-        raise ValueError("Invalid optimizer")
-
-    if cfg["use_scheduler"]=="yes":
-        if cfg['scheduler']=="step":
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg['step_size'], gamma=cfg['gamma'])
-        elif cfg['scheduler']=="reduce":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=cfg['gamma'], patience = cfg['patience'])
-        else:
-            raise ValueError("Invalid scheduler")
-
-    best_model = copy.deepcopy(fusion_model)
-    best_dev_loss = np.finfo('float32').max
-    best_dev_accuracy = 0
-    best_dev_balanced_accuracy = 0
-    best_dev_auroc = 0
-    best_dev_f1 = 0
-    wrapped_prediction_models = [ModelWrapper(prediction_models[i],criterion) for i in range(NUM_MODELS)]
-
-    epoch_no = 0
-
-    for epoch in tqdm(range(cfg['num_epochs'])):
-        noise_variance = 0.0
-        if (cfg["train_random_noise"]=="yes") and (cfg["increase_variance"]=="yes"):
-            noise_variance = cfg["noise_variance"]*(1-math.exp(-epoch_no*cfg["temperature"]))
-            epoch_no +=1
-
-        all_labels = []
-        all_pred_scores = [[] for i in range(NUM_MODELS)]
-        
-        for idx, batch in enumerate(train_loader):
-            x = [[] for i in range(NUM_MODELS)]
-            (x, y) = batch
-            y = y.to(device)
-            y_pred_scores = [[] for i in range(NUM_MODELS)]
-            y_preds = [[] for i in range(NUM_MODELS)]
-            y_vars = [[] for i in range(NUM_MODELS)]
-            
-            for i in range(NUM_MODELS):
-                x[i] = x[i].to(device)
-                if cfg["train_random_noise"]=="yes":
-                    noise = torch.randn(x[i].shape).to(device)
-                    adjusted_noise = noise*noise_variance
-                    x[i] += adjusted_noise
-                
-                y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=cfg["num_trials"])
-                y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
-                y_preds[i] = (y_pred_scores[i]>=0.5)
-                y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
-                
-                all_pred_scores[i].extend(y_pred_scores[i].to('cpu').numpy())
-
-            all_labels.extend(y.to('cpu').numpy())
-            
-            #forward pass
-            optimizer.zero_grad()
-            final_predictions = fusion_model((x,y_pred_scores, y_vars))
-            l = criterion(final_predictions.reshape(-1),y)
-            l.backward()
-            optimizer.step()
-
-            if ENABLE_WANDB:
-                wandb.log({"train_loss": l.to('cpu').item()})
-
-        #eval on dev set
-        dev_metrics = evaluate_fusion_model(fusion_model, dev_loader, prediction_models, cfg)
-        dev_loss = dev_metrics["loss"]
-        dev_accuracy = dev_metrics["accuracy"]
-        dev_balanced_accuracy = dev_metrics["weighted_accuracy"]
-        dev_auroc = dev_metrics["auroc"]
-        dev_f1 = dev_metrics["f1_score"]
-        dev_ece = dev_metrics["ECE"]
-        #print(f"Epoch {epoch}: dev accuracy: {dev_metrics['accuracy']}")
-
-        if cfg['use_scheduler']=="yes":
-            if cfg['scheduler']=='step':
-                scheduler.step()
-            else:
-                scheduler.step(dev_loss)
-
-        if dev_loss<best_dev_loss:
-            best_model = copy.deepcopy(fusion_model)
-
-            best_dev_loss = dev_loss
-            best_dev_accuracy = dev_accuracy
-            best_dev_balanced_accuracy = dev_balanced_accuracy
-            best_dev_auroc = dev_auroc
-            best_dev_f1 = dev_f1
-            best_dev_ece = dev_ece
     
-    # After training, collect logits and labels from calibration set
-    logits, labels = [], []
 
-    fusion_model.eval()
-    with torch.no_grad():
-        for batch in calib_loader:
-            x = [[] for i in range(NUM_MODELS)]
-            (x, y) = batch
-            y = y.to(device)
-            y_pred_scores = [[] for i in range(NUM_MODELS)]
-            y_vars = [[] for i in range(NUM_MODELS)]
+    
 
-            for i in range(NUM_MODELS):
-                x[i] = x[i].to(device)
-                y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=cfg["num_trials"])
-                y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
-                y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
 
-            final_predictions = fusion_model((x, y_pred_scores, y_vars))
-            logits.extend(final_predictions.reshape(-1).cpu().numpy())
-            labels.extend(y.reshape(-1).cpu().numpy())
+    initial_model = copy.deepcopy(fusion_model)
+    best_overall_dev_loss = np.finfo('float32').max
+    best_overall_model = None
+    
+    kf = KFold(n_splits=4, shuffle=True, random_state=cfg["random_state"])
+    
+    for fold, (train_index, dev_index) in enumerate(kf.split(train_df)):
+        train_subset = torch.utils.data.Subset(train_dataset, train_index)
+        dev_subset = torch.utils.data.Subset(train_dataset, dev_index)
+        
+        train_loader = torch.utils.data.DataLoader(train_subset, batch_size=cfg['batch_size'], shuffle=True)
+        dev_loader = torch.utils.data.DataLoader(dev_subset, batch_size=cfg['batch_size'])
 
-    # Fit Platt scaling model
-    platt_model = fit_platt_scaling(np.array(logits), np.array(labels))
+        model = copy.deepcopy(initial_model)
+        if cfg["optimizer"]=="AdamW":
+            optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
+        elif cfg["optimizer"]=="SGD":
+            optimizer = torch.optim.SGD(fusion_model.parameters(),lr=cfg['learning_rate'],momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
+        elif cfg["optimizer"]=="RMSprop":
+            optimizer = torch.optim.RMSprop(fusion_model.parameters(), lr=cfg['learning_rate'], momentum=cfg['momentum'],weight_decay=cfg['weight_decay'])
+        else:
+            raise ValueError("Invalid optimizer")
+        
+        if cfg["use_scheduler"]=="yes":
+            if cfg['scheduler']=="step":
+                scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=cfg['step_size'], gamma=cfg['gamma'])
+            elif cfg['scheduler']=="reduce":
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=cfg['gamma'], patience = cfg['patience'])
+            else:
+                raise ValueError("Invalid scheduler")
+        
 
-    # After the training loop ends, use the calibration set to determine conformity scores
+        best_model = copy.deepcopy(fusion_model)
+        best_dev_loss = np.finfo('float32').max
+        best_dev_accuracy = 0
+        best_dev_balanced_accuracy = 0
+        best_dev_auroc = 0
+        best_dev_f1 = 0
+        wrapped_prediction_models = [ModelWrapper(prediction_models[i],criterion) for i in range(NUM_MODELS)]
 
-    calibration_scores = []
-
-    # Loop through the calibration set to compute conformity scores
-    with torch.no_grad():
-        for batch in calib_loader:
-            x_calib = [[] for i in range(NUM_MODELS)]
-            (x_calib, y_calib) = batch
-            y_calib = y_calib.to(device)
-            y_pred_scores_calib = [[] for i in range(NUM_MODELS)]
-            y_vars_calib = [[] for i in range(NUM_MODELS)]
-            
-            for i in range(NUM_MODELS):
-                x_calib[i] = x_calib[i].to(device)
+        model.train()
+        for epoch in tqdm(range(cfg['num_epochs'])):
+            all_labels = []
+            all_pred_scores = [[] for i in range(NUM_MODELS)]
+        
+            for idx, batch in enumerate(train_loader):
+                x = [[] for i in range(NUM_MODELS)]
+                (x, y) = batch
+                y = y.to(device)
+                y_pred_scores = [[] for i in range(NUM_MODELS)]
+                y_preds = [[] for i in range(NUM_MODELS)]
+                y_vars = [[] for i in range(NUM_MODELS)]
                 
-                # Get multiple stochastic predictions for calibration
-                y_multi_preds_calib = wrapped_prediction_models[i].predict_on_batch(x_calib[i], iterations=cfg["num_trials"])
-                y_pred_scores_calib[i] = y_multi_preds_calib.mean(dim=-1).reshape(-1)
-                y_vars_calib[i] = y_multi_preds_calib.std(dim=-1).reshape(-1)
-            
-            # Fuse the predictions using the fusion model
-            final_calib_predictions = best_model((x_calib, y_pred_scores_calib, y_vars_calib))
-            
-            # get the calibrated probabilities
-            #print("Before Platt Scaling")
-            #print(final_calib_predictions)
-            final_calib_predictions = torch.tensor(apply_platt_scaling(platt_model, final_calib_predictions.cpu().numpy())).to(device)
-            #print("After Platt Scaling")
-            #print(final_calib_predictions)
-            
-            # Compute conformity scores based on residuals |y - f(x)|
-            conformity_scores = torch.abs(final_calib_predictions.reshape(-1) - y_calib)
-            calibration_scores.extend(conformity_scores.cpu().numpy())
+                for i in range(NUM_MODELS):
+                    x[i] = x[i].to(device)
+                    
+                    y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=cfg["num_trials"])
+                    y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
+                    y_preds[i] = (y_pred_scores[i]>=0.5)
+                    y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
+                    
+                    all_pred_scores[i].extend(y_pred_scores[i].to('cpu').numpy())
 
-    # Determine the conformity threshold for 95% confidence
-    alpha = 0.05
-    threshold = np.percentile(calibration_scores, 100 * (1 - alpha))
+                all_labels.extend(y.to('cpu').numpy())
+                
+                #forward pass
+                optimizer.zero_grad()
+                final_predictions = fusion_model((x,y_pred_scores, y_vars))
+                l = criterion(final_predictions.reshape(-1),y)
+                l.backward()
+                optimizer.step()
 
-    # # Save the threshold and best model for inference
-    # torch.save({
-    #     'model_state_dict': best_model.state_dict(),
-    #     'calibration_threshold': threshold
-    # }, 'calibrated_model.pth')
+                if ENABLE_WANDB:
+                    wandb.log({"train_loss": l.to('cpu').item()})
 
-    print(f"Calibration completed. Threshold for 95% confidence: {threshold}")
+            #eval on dev set
+            dev_metrics = evaluate_fusion_model(fusion_model, dev_loader, prediction_models, cfg)
+            dev_loss = dev_metrics["loss"]
+            dev_accuracy = dev_metrics["accuracy"]
+            dev_balanced_accuracy = dev_metrics["weighted_accuracy"]
+            dev_auroc = dev_metrics["auroc"]
+            dev_f1 = dev_metrics["f1_score"]
+            dev_ece = dev_metrics["ECE"]
+            #print(f"Epoch {epoch}: dev accuracy: {dev_metrics['accuracy']}")
 
+            if cfg['use_scheduler']=="yes":
+                if cfg['scheduler']=='step':
+                    scheduler.step()
+                else:
+                    scheduler.step(dev_loss)
 
-    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test", conformity_threshold=threshold, platt_model=platt_model)
+            if dev_loss<best_dev_loss:
+                best_model = copy.deepcopy(fusion_model)
+
+                best_dev_loss = dev_loss
+                best_dev_accuracy = dev_accuracy
+                best_dev_balanced_accuracy = dev_balanced_accuracy
+                best_dev_auroc = dev_auroc
+                best_dev_f1 = dev_f1
+                best_dev_ece = dev_ece
+                
+        print(f"Fold {fold}: Best dev loss: {best_dev_loss}")
+        
+        if best_dev_loss<best_overall_dev_loss:
+            best_overall_dev_loss = best_dev_loss
+            best_overall_model = copy.deepcopy(best_model)
+    
+    print("Best dev loss: ", best_overall_dev_loss)
+    
+    test_metrics = evaluate_fusion_model(best_overall_model, test_loader, prediction_models, cfg, split="test")
     if ENABLE_WANDB:
         wandb.log(test_metrics)
         wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1, "dev_ece":best_dev_ece})

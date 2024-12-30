@@ -1,3 +1,8 @@
+'''
+Summary: Apply conformal prediction on top of UFNet
+Find a threshold and determine the cases where 
+the prediction set size is one (withhold others).
+'''
 import os
 import copy
 import pickle
@@ -33,9 +38,9 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
-from sklearn.linear_model import LogisticRegression
-import torch.nn.functional as F
 
+import sys
+sys.path.append("/localdisk1/PARK/ufnet_aaai/UFNet/code/fusion_models/ufnet") 
 from constants import *
 
 '''
@@ -68,7 +73,6 @@ with open(os.path.join(BASE_DIR,"data/calib_set_participants.txt")) as f:
     ids = f.readlines()
     calib_ids = set([x.strip() for x in ids])
     
-
 	
 print(f"Number of patients in the dev and test set: {len(dev_ids)}, {len(test_ids)}")
 
@@ -509,20 +513,6 @@ class HybridFusionNetworkWithUncertainty(nn.Module):
         probs = self.sigmoid(logits) #(n,1)
         return probs
 
-''' 
-Write a custom loss function to incorporate label smoothing
-'''
-class LabelSmoothingLoss(nn.Module):
-    def __init__(self, smoothing=0.1):
-        super(LabelSmoothingLoss, self).__init__()
-        self.smoothing = smoothing
-        
-    def forward(self, predictions, targets):
-        # targets = targets.unqueeze(1)
-        smoothened_targets = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
-        loss = F.binary_cross_entropy(predictions, smoothened_targets, reduction='mean')
-        return loss
-    
 '''
 Evaluate performance on validation/test set.
 Returns all the metrics defined above and the loss.
@@ -627,29 +617,10 @@ def compute_metrics(y_true, y_pred_scores, threshold = 0.5):
     
     return metrics
 
-def fit_platt_scaling(calibration_logits, calibration_labels):
-    """
-    Fits a logistic regression model for Platt scaling.
-    """
-    platt_model = LogisticRegression()
-    calibration_logits = calibration_logits.reshape(-1, 1)
-    platt_model.fit(calibration_logits, calibration_labels)
-    return platt_model
-
-def apply_platt_scaling(platt_model, logits):
-    """
-    Applies Platt scaling to logits.
-    """
-    logits = logits.reshape(-1, 1)
-    calibrated_probs = platt_model.predict_proba(logits)[:, 1]  # Get probability of class 1
-    return calibrated_probs
-
-
-
 '''
 Main evaluation loop to test the fusion model
 '''
-def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev", conformity_threshold=0.5, platt_model=None):
+def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, split="dev", conformity_threshold=0.5):
     fusion_model.eval()
     z_critical = scipy.stats.t.ppf(q=0.975, df = config["num_trials"]-1)
 
@@ -701,12 +672,6 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
             loss += criterion(final_pred_scores.reshape(-1), y)*n
             n_samples+=n
         
-        if split == "test" and platt_model is not None:
-            print("Before Platt Scaling")
-            print(final_pred_scores)
-            final_pred_scores = torch.tensor(apply_platt_scaling(platt_model, final_pred_scores.cpu().numpy())).to(device)
-            print("After Platt Scaling")
-            print(final_pred_scores)
         all_final_predictions.extend(final_pred_scores.cpu().numpy())
         uncertain_indices.extend(index_mask.cpu().numpy())
 
@@ -722,7 +687,6 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 
     # now for test set, we will apply conformal prediction 
     
-    # print(all_final_predictions)
     
     if split=="test":
         count_single = 0
@@ -753,11 +717,6 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
         print(f"Number of conformal predictions: {len(all_final_predictions_conformal)}")
         # print the coverage percentage
         print(f"Coverage: {round(count_single/len(all_final_predictions_conformal), 2)}")
-        # wandb.log({"conformal_coverage": round(count_single/len(all_final_predictions_conformal), 2)})
-        
-         
-    
-    
     
     metrics = compute_metrics(all_labels, all_final_predictions)
     metrics["loss"] = loss.to('cpu').item() / n_samples
@@ -799,11 +758,10 @@ def evaluate_fusion_model(fusion_model, dataloader, prediction_models, config, s
 @click.option("--step_size",default=21)
 @click.option("--gamma",default=0.34188571201807494)
 @click.option("--patience",default=6)
-@click.option("--smoothing_factor",default=0.1)
 def main(**cfg):
     global NUM_MODELS
 
-    ENABLE_WANDB = True
+    ENABLE_WANDB = False
     if ENABLE_WANDB:
         wandb.init(project="park_final_experiments", config=cfg)
 
@@ -964,8 +922,7 @@ def main(**cfg):
     fusion_model = HybridFusionNetworkWithUncertainty(feature_shapes, cfg)
     fusion_model = fusion_model.to(device)
     
-    criterion = LabelSmoothingLoss(smoothing=cfg["smoothing_factor"])
-    
+    criterion = nn.BCELoss()
     if cfg["optimizer"]=="AdamW":
         optimizer = torch.optim.AdamW(fusion_model.parameters(),lr=cfg['learning_rate'],betas=(cfg['beta1'],cfg['beta2']),weight_decay=cfg['weight_decay'])
     elif cfg["optimizer"]=="SGD":
@@ -1061,32 +1018,7 @@ def main(**cfg):
             best_dev_auroc = dev_auroc
             best_dev_f1 = dev_f1
             best_dev_ece = dev_ece
-    
-    # After training, collect logits and labels from calibration set
-    logits, labels = [], []
-
-    fusion_model.eval()
-    with torch.no_grad():
-        for batch in calib_loader:
-            x = [[] for i in range(NUM_MODELS)]
-            (x, y) = batch
-            y = y.to(device)
-            y_pred_scores = [[] for i in range(NUM_MODELS)]
-            y_vars = [[] for i in range(NUM_MODELS)]
-
-            for i in range(NUM_MODELS):
-                x[i] = x[i].to(device)
-                y_multi_preds = wrapped_prediction_models[i].predict_on_batch(x[i], iterations=cfg["num_trials"])
-                y_pred_scores[i] = y_multi_preds.mean(dim=-1).reshape(-1)
-                y_vars[i] = y_multi_preds.std(dim=-1).reshape(-1)
-
-            final_predictions = fusion_model((x, y_pred_scores, y_vars))
-            logits.extend(final_predictions.reshape(-1).cpu().numpy())
-            labels.extend(y.reshape(-1).cpu().numpy())
-
-    # Fit Platt scaling model
-    platt_model = fit_platt_scaling(np.array(logits), np.array(labels))
-
+            
     # After the training loop ends, use the calibration set to determine conformity scores
 
     calibration_scores = []
@@ -1111,13 +1043,6 @@ def main(**cfg):
             # Fuse the predictions using the fusion model
             final_calib_predictions = best_model((x_calib, y_pred_scores_calib, y_vars_calib))
             
-            # get the calibrated probabilities
-            print("Before Platt Scaling")
-            print(final_calib_predictions)
-            final_calib_predictions = torch.tensor(apply_platt_scaling(platt_model, final_calib_predictions.cpu().numpy())).to(device)
-            print("After Platt Scaling")
-            print(final_calib_predictions)
-            
             # Compute conformity scores based on residuals |y - f(x)|
             conformity_scores = torch.abs(final_calib_predictions.reshape(-1) - y_calib)
             calibration_scores.extend(conformity_scores.cpu().numpy())
@@ -1134,13 +1059,14 @@ def main(**cfg):
 
     print(f"Calibration completed. Threshold for 95% confidence: {threshold}")
 
-
-    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test", conformity_threshold=threshold, platt_model=platt_model)
+    
+    test_metrics = evaluate_fusion_model(best_model, test_loader, prediction_models, cfg, split="test", conformity_threshold=threshold)
     if ENABLE_WANDB:
+        wandb.log({"conformity_score": threshold})
         wandb.log(test_metrics)
         wandb.log({"dev_accuracy":best_dev_accuracy, "dev_balanced_accuracy":best_dev_balanced_accuracy, "dev_loss":best_dev_loss, "dev_auroc":best_dev_auroc, "dev_f1":best_dev_f1, "dev_ece":best_dev_ece})
+    
     print(test_metrics)
 
 if __name__ == "__main__":
     main()
-    
