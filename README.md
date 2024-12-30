@@ -13,6 +13,17 @@ To access the extracted features, please go to ```/data``` folder in this reposi
 * Task-specific features are also organized in this folder: [Finger-tapping](data/finger_tapping/features_demography_diagnosis_Nov22_2023.csv), [Smile](data/facial_expression_smile/facial_dataset.csv), 
 and [Speech](data/quick_brown_fox/wavlm_fox_features.csv).
 
+**Code Description**
+
+Note: The feature extraction codes will be added to the repository soon. Currently, the repository contains code for training and running the [task-specific models](code/unimodal_models) and [UFNet](code/fusion_models/ufnet), the [baselines](code/fusion_models/baselines) we experimented, and the [ablation studies](code/fusion_models/ufnet/ablations). 
+We also provide code for [demographic information analysis](code/demographic_details/demography_summary_table.py).
+
+* To run the UFNet model, you first need to run and save the task-specific models. Please make sure the hyper-parameters are the same as we report in our paper (the arxiv paper has the detailed hyper-parameters for both task-specific models and the UFNet: https://arxiv.org/abs/2406.14856).
+  * [Finger-tapping model](/code/unimodal_models/finger_tapping/unimodal_finger_baal.py)
+  * [Smile model](code/unimodal_models/facial_expression_smile/unimodal_smile_baal.py)
+  * [Speech model](code/unimodal_models/quick_brown_fox/unimodal_fox_baal.py)
+ 
+* 
 
 **References**
 1. Zhou, Andy, et al. "YouTubePD: A Multimodal Benchmark for Parkinson’s Disease Analysis." Advances in Neural Information Processing Systems 36 (2024).
