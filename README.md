@@ -1,5 +1,6 @@
 # UFNet
-Official Github repository for the paper "Accessible, At-Home Detection of Parkinson’s Disease via Multi-Task Video Analysis"
+Official Github repository for the paper "Accessible, At-Home Detection of Parkinson’s Disease via Multi-Task Video Analysis". The paper has been accepted at AAAI 2025 and the published version will appear soon.
+Until then, please refer to the arxiv version: https://arxiv.org/abs/2406.14856
 
 **Data Description**
 
@@ -15,7 +16,7 @@ and [Speech](data/quick_brown_fox/wavlm_fox_features.csv).
 
 **Code Description**
 
-Note: The feature extraction codes will be added to the repository soon. Currently, the repository contains code for training and running the [task-specific models](code/unimodal_models) and [UFNet](code/fusion_models/ufnet), the [baselines](code/fusion_models/baselines) we experimented, and the [ablation studies](code/fusion_models/ufnet/ablations). 
+Note: The feature extraction codes will be added to the repository soon (please email us if you need it earlier). Currently, the repository contains code for training and running the [task-specific models](code/unimodal_models) and [UFNet](code/fusion_models/ufnet), the [baselines](code/fusion_models/baselines) we experimented, and the [ablation studies](code/fusion_models/ufnet/ablations). 
 We also provide code for [demographic information analysis](code/demographic_details/demography_summary_table.py).
 
 * To run the UFNet model, you first need to run and save the task-specific models. Please make sure the hyper-parameters are the same as we report in our paper (the arxiv paper has the detailed hyper-parameters for both task-specific models and the UFNet: https://arxiv.org/abs/2406.14856).
@@ -25,5 +26,24 @@ We also provide code for [demographic information analysis](code/demographic_det
  
 * Next, run [UFNet without prediction withholding](code/fusion_models/ufnet/UFNet_no_withhold.py) or [UFNet with withholding uncertain predictions](code/fusion_models/ufnet/UFNet_withhold_predictions.py). Also, you can train/run [UFNet with different multi-task combinations](code/fusion_models/ufnet/multi_task_combinations.py) by adjusting the hyper-parameters accordingly.
 
+**Re-training the Models on a New Dataset**
+
+If you have collected video data of similar tasks from PD patients and healthy individuals, you can use our codebase to extend our dataset and re-train the models.
+
+* From the new videos, extract task-specific features (feature extraction codes will be added soon). Merge these new feature datasets with our previous datasets. Update the validation and test ids if you want some of your new data to be included for model selection and evaluation.
+* Re-train the task-specific models (you can perform a hyper-param search as mentioned in the detailed version of our paper).
+* Re-train and evaluate the UFNet model with the new datasets.
+
 **References**
 1. Zhou, Andy, et al. "YouTubePD: A Multimodal Benchmark for Parkinson’s Disease Analysis." Advances in Neural Information Processing Systems 36 (2024).
+
+**Cite Our Paper**
+If this repository is relevant and helpful for your research, please cite our paper:
+```
+@article{islam2024accessible,
+  title={Accessible, At-Home Detection of Parkinson's Disease via Multi-task Video Analysis},
+  author={Islam, Md Saiful and Adnan, Tariq and Freyberg, Jan and Lee, Sangwu and Abdelkader, Abdelrahman and Pawlik, Meghan and Schwartz, Cathe and Jaffe, Karen and Schneider, Ruth B and Dorsey, E and others},
+  journal={arXiv preprint arXiv:2406.14856},
+  year={2024}
+}
+```
