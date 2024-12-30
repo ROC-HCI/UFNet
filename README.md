@@ -23,7 +23,7 @@ We also provide code for [demographic information analysis](code/demographic_det
   * [Smile model](code/unimodal_models/facial_expression_smile/unimodal_smile_baal.py)
   * [Speech model](code/unimodal_models/quick_brown_fox/unimodal_fox_baal.py)
  
-* 
+* Next, run [UFNet without prediction withholding](code/fusion_models/ufnet/UFNet_no_withhold.py) or [UFNet with withholding uncertain predictions](code/fusion_models/ufnet/UFNet_withhold_predictions.py). Also, you can train/run [UFNet with different multi-task combinations](code/fusion_models/ufnet/multi_task_combinations.py) by adjusting the hyper-parameters accordingly.
 
 **References**
 1. Zhou, Andy, et al. "YouTubePD: A Multimodal Benchmark for Parkinson’s Disease Analysis." Advances in Neural Information Processing Systems 36 (2024).
